@@ -1,0 +1,7 @@
+config:
+  default: true
+  MD013:
+    line_length: 100
+    headings: false
+    tables: false
+    code_blocks: false

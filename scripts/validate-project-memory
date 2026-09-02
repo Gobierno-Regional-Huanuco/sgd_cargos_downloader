@@ -1,0 +1,2078 @@
+#!/bin/sh
+""":"
+exec python3 -I "$0" "$@"
+":"""
+
+# ruff: noqa: E402
+
+from __future__ import annotations
+
+import sys
+
+DESCRIPTION = "Validate a project's living memory without modifying it."
+
+# A copied validator lives inside a consumer-controlled repository. Relaunch in
+# isolated mode before importing validator dependencies so neither scripts/ nor
+# PYTHONPATH can shadow json, yaml, ast or another module.
+if not sys.flags.isolated:
+    import os as bootstrap_os
+
+    bootstrap_os.execv(
+        sys.executable,
+        [sys.executable, "-I", sys.argv[0], *sys.argv[1:]],
+    )
+
+import argparse
+import ast
+import io
+import json
+import os
+import re
+import tokenize
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+try:
+    import yaml as yaml_parser
+except ImportError:  # Optional: copied validators must still run without PyYAML.
+    yaml_parser = None
+
+
+BASE_FILES = (
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".markdownlint-cli2.yaml",
+    "docs/guia_IA.md",
+    "docs/convenciones.md",
+    "docs/procedimientos.md",
+    "docs/memoria-viva/README.md",
+    "docs/memoria-viva/workflow.md",
+    "docs/memoria-viva/portable-standard.md",
+    "docs/memoria-viva/resource-efficiency.md",
+    "docs/memoria-viva/detection-strategies.md",
+    "docs/memoria-viva/http-resource-design.md",
+    "docs/memoria-viva/succession-parity.md",
+    "docs/arquitectura.md",
+    "docs/entorno.md",
+    "docs/context-template.md",
+    ".github/copilot-instructions.md",
+    "scripts/validate-project-memory",
+)
+REQUIRED_PROMPTS = (
+    ".github/prompts/base_universal.prompt.md",
+    ".github/prompts/codigo.prompt.md",
+    ".github/prompts/inicializar_proyecto.prompt.md",
+    ".github/prompts/memoria.prompt.md",
+    ".github/prompts/modulo.prompt.md",
+    ".github/prompts/reporte.prompt.md",
+    ".github/prompts/revision.prompt.md",
+)
+MIN_PROMPT_WORDS = 12
+HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
+HTTP_RESOURCE_DESIGN_SINCE = (1, 4, 0)
+HTTP_RESOURCE_TYPES = {"recurso", "subrecurso", "relacion", "proyeccion", "consulta", "accion"}
+HTTP_ROUTE_ROLES = {"canonica", "contextual"}
+HTTP_MUTATION_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+IR_SCHEMA_VERSION = 1
+ACCESS_ADAPTER_SCHEMA_VERSION = 1
+ACCESS_ADAPTER_PATH = ".project-memory/access-adapters.json"
+IGNORE_PARTS = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "examples",
+    "fixtures",
+    "htmlcov",
+    "node_modules",
+    "test",
+    "tests",
+    # Herramienta local con plantillas deliberadas; no forma parte del producto.
+    "gestionar-memoria-viva-proyecto",
+    "vendor",
+    "venv",
+}
+SOURCE_SUFFIXES = (
+    ".cs",
+    ".go",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".swift",
+    ".ts",
+    ".tsx",
+)
+SEMVER_PATTERN = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-((?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
+HTML_DIRECTIVE = re.compile(
+    r"^(?:markdownlint|prettier|cspell|spellcheck|vale|htmlhint|eslint|stylelint|"
+    r"istanbul|coverage|nosemgrep|snyk|generated|region|endregion|toc\b|/toc\b|"
+    r"omit\s+in\s+toc|\[if\b|endif\b)",
+    re.I,
+)
+API_SIGNAL = re.compile(
+    r"FastAPI|Flask|APIRouter|Blueprint|@(?:RestController|Controller|RequestMapping|"
+    r"GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping|Get|Post|Put|Patch|Delete)\b|"
+    r"urlpatterns|router\.register|include_router|GraphQL|grpc|express\s*\(|http\.HandleFunc|"
+    r"\.(?:route|use)\s*\(",
+    re.I,
+)
+CLI_SIGNAL = re.compile(
+    r"argparse\.ArgumentParser|@(?:click\.)?(?:command|group)\b|click\.group|"
+    r"Typer\s*\(|commander|cobra\.Command|clap::|picocli",
+    re.I,
+)
+MODEL_SIGNAL = re.compile(
+    r"sqlalchemy|django\.db|prisma|typeorm|sequelize|@Entity\b|gorm|"
+    r"\brelationship\s*\(|\b(?:ForeignKey|OneToOneField|ManyToManyField)\s*\(|"
+    r"\bmapped_column\s*\(|\bColumn\s*\(",
+    re.I,
+)
+RELATION_SIGNAL = re.compile(
+    r"\brelationship\s*\(|\b(?:ForeignKey|ForeignKeyConstraint|OneToOneField|ManyToManyField)\s*\(|"
+    r"\bField\s*\([^)]*foreign_key\s*=",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class Finding:
+    level: str
+    code: str
+    message: str
+    evidence: tuple[str, ...] = ()
+    confidence: str | None = None
+
+
+@dataclass(frozen=True)
+class HttpOperation:
+    method: str
+    route: str
+    access: str
+    evidence: tuple[str, ...]
+    confidence: str = "CONFIRMED"
+    dependencies: tuple[str, ...] = ()
+    source_role: str = "active"
+
+
+@dataclass(frozen=True)
+class DocumentedEndpoint:
+    method: str
+    route: str
+    access: str
+    endpoint_type: str = ""
+    route_role: str = ""
+    lifecycle: str = ""
+    owner_concept: str = ""
+    owner_module: str = ""
+    canonical_path: str = ""
+    purpose: str = ""
+    decision: str = ""
+
+
+@dataclass(frozen=True)
+class ModelRelation:
+    source: str
+    target: str
+    field: str | None
+    evidence: tuple[str, ...]
+    confidence: str = "CONFIRMED"
+    source_role: str = "active"
+
+
+@dataclass(frozen=True)
+class SourceRecord:
+    path: Path
+    raw: str
+    role: str
+
+
+@dataclass(frozen=True)
+class ProjectLayout:
+    source_roots: tuple[str, ...]
+    evidence: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AccessRule:
+    rule_id: str
+    symbol: str
+    access: str
+    evidence: str
+
+
+@dataclass
+class ScopeContext:
+    profile: str
+    level: str | None
+    modules: set[str]
+    changed: set[str]
+    inspected: set[str] = field(default_factory=set)
+    checks_executed: set[str] = field(default_factory=set)
+    checks_skipped: set[str] = field(default_factory=set)
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.modules or self.changed)
+
+
+@dataclass(frozen=True)
+class SemanticVersion:
+    major: int
+    minor: int
+    patch: int
+    prerelease: tuple[str, ...]
+
+
+def parse_semver(value: str) -> SemanticVersion | None:
+    match = SEMVER_PATTERN.fullmatch(value)
+    if not match:
+        return None
+    prerelease = tuple(match.group(4).split(".")) if match.group(4) else ()
+    return SemanticVersion(int(match.group(1)), int(match.group(2)), int(match.group(3)), prerelease)
+
+
+def compare_semver(left: SemanticVersion, right: SemanticVersion) -> int:
+    left_core = (left.major, left.minor, left.patch)
+    right_core = (right.major, right.minor, right.patch)
+    if left_core != right_core:
+        return 1 if left_core > right_core else -1
+    if not left.prerelease and not right.prerelease:
+        return 0
+    if not left.prerelease:
+        return 1
+    if not right.prerelease:
+        return -1
+    for left_id, right_id in zip(left.prerelease, right.prerelease, strict=False):
+        if left_id == right_id:
+            continue
+        left_numeric = left_id.isdigit()
+        right_numeric = right_id.isdigit()
+        if left_numeric and right_numeric:
+            return 1 if int(left_id) > int(right_id) else -1
+        if left_numeric != right_numeric:
+            return -1 if left_numeric else 1
+        return 1 if left_id > right_id else -1
+    if len(left.prerelease) == len(right.prerelease):
+        return 0
+    return 1 if len(left.prerelease) > len(right.prerelease) else -1
+
+
+def files(root: Path, suffixes: tuple[str, ...] | None = None):
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if name not in IGNORE_PARTS and not (current_path / name).is_symlink()
+        )
+        for name in sorted(filenames):
+            path = current_path / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            if suffixes is None or path.suffix.lower() in suffixes:
+                yield path
+
+
+def text(path: Path) -> str:
+    if path.is_symlink():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def source_role(root: Path, path: Path) -> str:
+    relative = path.relative_to(root)
+    lowered_parts = tuple(part.casefold() for part in relative.parts)
+    lowered_name = path.name.casefold()
+    if relative.as_posix() == "scripts/validate-project-memory":
+        return "tooling"
+    if relative.as_posix() == "scripts/test_validator.py":
+        return "test"
+    if any(part in {"migration", "migrations"} for part in lowered_parts):
+        return "historical"
+    if "alembic" in lowered_parts and "versions" in lowered_parts:
+        return "historical"
+    if (
+        lowered_name.startswith("test_")
+        or lowered_name.endswith("_test.py")
+        or re.search(r"\.(?:spec|test)\.[^.]+$", lowered_name)
+    ):
+        return "test"
+    return "active"
+
+
+def source_records(root: Path, roles: tuple[str, ...] = ("active",)):
+    for path in files(root, SOURCE_SUFFIXES):
+        role = source_role(root, path)
+        if role in roles:
+            yield SourceRecord(path, text(path), role)
+
+
+def source_texts(root: Path):
+    for record in source_records(root):
+        yield record.path, record.raw
+
+
+def marker_matches(path: Path, raw: str, pattern: re.Pattern[str]):
+    if path.suffix.lower() != ".py":
+        for match in pattern.finditer(raw):
+            yield match, raw.count("\n", 0, match.start()) + 1
+        return
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(raw).readline):
+            if token.type != tokenize.COMMENT:
+                continue
+            for match in pattern.finditer(token.string):
+                yield match, token.start[0]
+    except (IndentationError, tokenize.TokenError):
+        return
+
+
+def python_signal_text(raw: str) -> str:
+    """Return Python code without comments or string contents for signal regexes."""
+    try:
+        tokens = []
+        for token in tokenize.generate_tokens(io.StringIO(raw).readline):
+            if token.type in {tokenize.COMMENT, tokenize.STRING}:
+                token = token._replace(string="")
+            tokens.append(token)
+        return tokenize.untokenize(tokens)
+    except (IndentationError, tokenize.TokenError):
+        return ""
+
+
+def source_location(root: Path, path: Path, node: ast.AST | None = None) -> str:
+    relative = path.relative_to(root).as_posix()
+    return f"{relative}:{node.lineno}" if node is not None and hasattr(node, "lineno") else relative
+
+
+def safe_local_file(root: Path, relative: Path) -> bool:
+    if relative.is_absolute() or ".." in relative.parts:
+        return False
+    candidate = root / relative
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            return False
+    return candidate.is_file()
+
+
+def load_access_rules(root: Path) -> tuple[tuple[AccessRule, ...], list[Finding]]:
+    path = root / ACCESS_ADAPTER_PATH
+    if not path.exists():
+        return (), []
+    location = ACCESS_ADAPTER_PATH
+    if path.is_symlink():
+        return (), [Finding("ERROR", "access-adapter", f"El adaptador no puede ser symlink: {location}")]
+    try:
+        data = json.loads(text(path))
+    except json.JSONDecodeError as exc:
+        return (), [Finding("ERROR", "access-adapter", f"JSON inválido en {location}: línea {exc.lineno}")]
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"schema_version", "rules"}
+        or data.get("schema_version") != ACCESS_ADAPTER_SCHEMA_VERSION
+    ):
+        return (), [Finding("ERROR", "access-adapter", f"{location} requiere schema_version {ACCESS_ADAPTER_SCHEMA_VERSION}")]
+    raw_rules = data.get("rules")
+    if not isinstance(raw_rules, list):
+        return (), [Finding("ERROR", "access-adapter", f"{location}.rules debe ser una lista")]
+    rules: list[AccessRule] = []
+    findings: list[Finding] = []
+    identifiers: set[str] = set()
+    for index, item in enumerate(raw_rules):
+        item_location = f"{location} rules[{index}]"
+        if not isinstance(item, dict) or set(item) != {"id", "symbol", "access", "evidence"}:
+            findings.append(Finding("ERROR", "access-adapter", f"Regla inválida: {item_location}"))
+            continue
+        rule_id = item.get("id")
+        symbol = item.get("symbol")
+        access = item.get("access")
+        evidence = item.get("evidence")
+        valid = (
+            isinstance(rule_id, str)
+            and bool(re.fullmatch(r"[a-z][a-z0-9-]*", rule_id))
+            and isinstance(symbol, str)
+            and bool(re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", symbol))
+            and isinstance(access, str)
+            and bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9:_-]*", access))
+            and isinstance(evidence, str)
+        )
+        if not valid or rule_id in identifiers:
+            findings.append(Finding("ERROR", "access-adapter", f"Regla inválida o duplicada: {item_location}"))
+            continue
+        evidence_target = evidence.split("#", 1)[0]
+        evidence_path = Path(evidence_target)
+        safe_evidence = bool(evidence_target) and safe_local_file(root, evidence_path)
+        if not safe_evidence:
+            findings.append(Finding("ERROR", "access-adapter", f"Evidencia local inválida en {item_location}: {evidence}"))
+            continue
+        identifiers.add(rule_id)
+        rules.append(AccessRule(rule_id, symbol, access, evidence))
+    return tuple(rules), findings
+
+
+def openapi_operations(data: Any, path: Path, root: Path) -> tuple[set[HttpOperation], list[Finding]]:
+    operations: set[HttpOperation] = set()
+    findings: list[Finding] = []
+    if not isinstance(data, dict):
+        return operations, [Finding("ERROR", "openapi-invalid", f"OpenAPI no es un objeto: {path.name}")]
+    paths = data.get("paths", {})
+    if not isinstance(paths, dict):
+        return operations, [Finding("ERROR", "openapi-invalid", f"paths no es un objeto: {path.name}")]
+    global_security = data.get("security", [])
+    for route, spec in paths.items():
+        if not isinstance(route, str) or not isinstance(spec, dict):
+            findings.append(Finding("WARN", "openapi-path", f"Ruta OpenAPI no evaluable en {path.name}"))
+            continue
+        for method, operation in spec.items():
+            method_upper = str(method).upper()
+            if method_upper not in HTTP_METHODS:
+                continue
+            if not isinstance(operation, dict):
+                access = "unknown"
+                findings.append(
+                    Finding("WARN", "openapi-operation", f"Operación no evaluable: {method_upper} {route}")
+                )
+            else:
+                security = operation["security"] if "security" in operation else global_security
+                access = "authenticated" if security else "public"
+            operations.add(
+                HttpOperation(method_upper, route, access, (f"{path.relative_to(root).as_posix()} paths.{route}.{method}",))
+            )
+    return operations, findings
+
+
+def detect_openapi(root: Path) -> tuple[set[HttpOperation], list[Finding], bool]:
+    operations: set[HttpOperation] = set()
+    findings: list[Finding] = []
+    candidates = [p for p in files(root, (".json", ".yaml", ".yml")) if "openapi" in p.name.lower()]
+    for path in candidates:
+        raw = text(path)
+        if path.suffix.lower() == ".json":
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                findings.append(
+                    Finding("ERROR", "openapi-invalid", f"JSON OpenAPI inválido en {path.name}: línea {exc.lineno}")
+                )
+                continue
+        else:
+            if yaml_parser is None:
+                findings.append(
+                    Finding(
+                        "NOT_EVALUATED",
+                        "openapi-yaml-parser",
+                        f"No se evaluó {path.name}: instalar PyYAML o aportar OpenAPI JSON",
+                    )
+                )
+                continue
+            try:
+                data = yaml_parser.safe_load(raw)
+            except yaml_parser.YAMLError as exc:
+                findings.append(Finding("ERROR", "openapi-invalid", f"YAML OpenAPI inválido en {path.name}: {exc}"))
+                continue
+        parsed, parse_findings = openapi_operations(data, path, root)
+        operations.update(parsed)
+        findings.extend(parse_findings)
+    return operations, findings, bool(candidates)
+
+
+def expression_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = expression_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
+
+
+def constant_string(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def join_route(*parts: str) -> str:
+    clean = [part.strip("/") for part in parts if part and part != "/"]
+    return "/" + "/".join(clean) if clean else "/"
+
+
+def discover_project_layout(root: Path) -> tuple[ProjectLayout, list[Finding]]:
+    candidates: set[str] = set()
+    evidence: list[str] = []
+    findings: list[Finding] = []
+    declared_root_seen = False
+    pyproject = root / "pyproject.toml"
+    raw = text(pyproject) if pyproject.exists() else ""
+    if raw:
+        section = ""
+        for number, line in enumerate(raw.splitlines(), 1):
+            clean = line.split("#", 1)[0].strip()
+            section_match = re.fullmatch(r"\[([^]]+)]", clean)
+            if section_match:
+                section = section_match.group(1).casefold()
+                continue
+            values: list[str] = []
+            if section == "tool.setuptools.package-dir" and re.match(r"(?:''|\"\")\s*=", clean):
+                values = re.findall(r"=\s*['\"]([^'\"]+)['\"]", clean)
+            elif section == "tool.setuptools" and clean.startswith("package-dir"):
+                values = re.findall(r"(?:''|\"\")\s*=\s*['\"]([^'\"]+)['\"]", clean)
+            elif section == "tool.poetry" and (clean.startswith("packages") or "from" in clean):
+                values = re.findall(r"\bfrom\s*=\s*['\"]([^'\"]+)['\"]", clean)
+            elif section == "tool.pdm.build" and clean.startswith("package-dir"):
+                values = re.findall(r"=\s*['\"]([^'\"]+)['\"]", clean)
+            elif section == "tool.hatch.build.targets.wheel" and clean.startswith("packages"):
+                package_paths = re.findall(r"['\"]([^'\"]+)['\"]", clean)
+                values = [str(Path(value).parent) for value in package_paths if Path(value).parent != Path(".")]
+            for value in values:
+                declared_root_seen = True
+                declared_path = Path(value)
+                normalized = declared_path.as_posix().rstrip("/") or "."
+                candidate = root / normalized
+                safe_root = not declared_path.is_absolute() and ".." not in declared_path.parts
+                if safe_root and candidate.is_dir() and not candidate.is_symlink():
+                    candidates.add(normalized)
+                    evidence.append(f"pyproject.toml:{number} raíz Python {normalized}")
+                else:
+                    findings.append(Finding("NOT_EVALUATED", "python-layout", f"Raíz Python declarada no disponible: {normalized}", (f"pyproject.toml:{number}",), "UNRESOLVED"))
+    conventional = root / "src"
+    if (
+        not declared_root_seen
+        and conventional.is_dir()
+        and not conventional.is_symlink()
+        and any(files(conventional, (".py",)))
+    ):
+        candidates.add("src")
+        evidence.append("src/ convención con fuentes Python")
+    ordered = tuple(sorted(candidates, key=lambda value: (-len(Path(value).parts), value)) + ["."])
+    return ProjectLayout(ordered, tuple(sorted(set(evidence)))), findings
+
+
+def module_name(root: Path, layout: ProjectLayout, path: Path) -> str:
+    relative = path.relative_to(root)
+    for source_root in layout.source_roots:
+        try:
+            relative = relative if source_root == "." else relative.relative_to(source_root)
+            break
+        except ValueError:
+            continue
+    relative = relative.with_suffix("")
+    parts = list(relative.parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def resolve_import_module(current: str, imported: str | None, level: int) -> str:
+    if level == 0:
+        return imported or ""
+    package = current.split(".")[:-1]
+    keep = max(0, len(package) - level + 1)
+    base = package[:keep]
+    if imported:
+        base.extend(imported.split("."))
+    return ".".join(base)
+
+
+def detect_python_endpoints(
+    root: Path,
+    layout: ProjectLayout,
+    access_rules: tuple[AccessRule, ...],
+) -> tuple[set[HttpOperation], list[Finding], bool]:
+    parsed: dict[str, tuple[Path, ast.Module, str]] = {}
+    all_parsed: dict[str, tuple[Path, ast.Module, str]] = {}
+    potential = False
+    for path, raw in source_texts(root):
+        if path.suffix.lower() != ".py":
+            continue
+        signal = bool(API_SIGNAL.search(python_signal_text(raw)))
+        potential = potential or signal
+        try:
+            entry = (path, ast.parse(raw), raw)
+            all_parsed[module_name(root, layout, path)] = entry
+            if signal:
+                parsed[module_name(root, layout, path)] = entry
+        except SyntaxError:
+            continue
+
+    constants: dict[str, str] = {}
+    aliases: dict[str, dict[str, str]] = {}
+    router_prefixes: dict[str, tuple[str, str]] = {}
+    router_kinds: dict[str, str] = {}
+    router_dependencies: dict[str, tuple[str, ...]] = {}
+    dynamic_routers: set[str] = set()
+    incomplete_includes: set[str] = set()
+    dynamic: list[str] = []
+    for module, (path, tree, _) in all_parsed.items():
+        module_aliases: dict[str, str] = {}
+        for statement in tree.body:
+            if isinstance(statement, ast.ImportFrom):
+                imported_module = resolve_import_module(module, statement.module, statement.level)
+                for item in statement.names:
+                    module_aliases[item.asname or item.name] = f"{imported_module}.{item.name}".strip(".")
+            elif isinstance(statement, ast.Import):
+                for item in statement.names:
+                    alias = item.asname or item.name.split(".")[0]
+                    module_aliases[alias] = item.name if item.asname else alias
+            elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                value = statement.value
+                for target in targets:
+                    if isinstance(target, ast.Name) and value is not None:
+                        literal = constant_string(value)
+                        if literal is not None:
+                            constants[f"{module}.{target.id}"] = literal
+        aliases[module] = module_aliases
+
+    def object_ref(module: str, node: ast.expr) -> str | None:
+        name = expression_name(node)
+        if not name:
+            return None
+        head, _, tail = name.partition(".")
+        if head in aliases.get(module, {}):
+            base = aliases[module][head]
+            return f"{base}.{tail}" if tail else base
+        return f"{module}.{name}"
+
+    def static_string(module: str, node: ast.expr) -> str | None:
+        literal = constant_string(node)
+        if literal is not None:
+            return literal
+        reference = object_ref(module, node)
+        return constants.get(reference or "")
+
+    def dependency_symbols(module: str, nodes: list[ast.AST]) -> tuple[str, ...]:
+        symbols: set[str] = set()
+        for root_node in nodes:
+            for child in ast.walk(root_node):
+                if not isinstance(child, ast.Call):
+                    continue
+                dependency_constructor = (
+                    object_ref(module, child.func) or expression_name(child.func)
+                ).split(".")[-1]
+                if dependency_constructor not in {"Depends", "Security"}:
+                    continue
+                if child.args and (symbol := object_ref(module, child.args[0])):
+                    symbols.add(symbol)
+        return tuple(sorted(symbols))
+
+    for module, (path, tree, _) in parsed.items():
+        for statement in tree.body:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            value = statement.value
+            if not isinstance(value, ast.Call):
+                continue
+            constructor = (object_ref(module, value.func) or expression_name(value.func)).split(".")[-1]
+            if constructor not in {"APIRouter", "FastAPI", "Blueprint"}:
+                continue
+            prefix_node = next((kw.value for kw in value.keywords if kw.arg in {"prefix", "url_prefix"}), None)
+            prefix = static_string(module, prefix_node) if prefix_node is not None else ""
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                reference = f"{module}.{target.id}"
+                router_kinds[reference] = "application" if constructor == "FastAPI" else "router"
+                dependency_node = next((kw.value for kw in value.keywords if kw.arg == "dependencies"), None)
+                router_dependencies[reference] = dependency_symbols(module, [dependency_node] if dependency_node else [])
+                if prefix is None:
+                    dynamic_routers.add(reference)
+                    dynamic.append(source_location(root, path, value) + f" prefijo dinámico de {target.id}")
+                else:
+                    router_prefixes[reference] = (prefix, source_location(root, path, value))
+
+    parents: dict[str, list[tuple[str, str, str, tuple[str, ...]]]] = {}
+    raw_operations: list[tuple[str, str, str, tuple[str, ...], tuple[str, ...]]] = []
+    supported = {method.lower() for method in HTTP_METHODS}
+    for module, (path, tree, _) in parsed.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and expression_name(node.func).endswith(".include_router") and node.args:
+                parent = object_ref(module, node.func.value) if isinstance(node.func, ast.Attribute) else None
+                child = object_ref(module, node.args[0])
+                prefix_node = next((kw.value for kw in node.keywords if kw.arg == "prefix"), None)
+                prefix = static_string(module, prefix_node) if prefix_node is not None else ""
+                dependency_node = next((kw.value for kw in node.keywords if kw.arg == "dependencies"), None)
+                include_dependencies = dependency_symbols(module, [dependency_node] if dependency_node else [])
+                evidence = source_location(root, path, node)
+                if parent and child and prefix is not None:
+                    parents.setdefault(child, []).append((parent, prefix, evidence, include_dependencies))
+                else:
+                    if child:
+                        incomplete_includes.add(child)
+                    dynamic.append(evidence + " inclusión o prefijo no resoluble")
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call) or not decorator.args or not isinstance(decorator.func, ast.Attribute):
+                    continue
+                method = decorator.func.attr.lower()
+                if method not in supported | {"route"}:
+                    continue
+                owner = object_ref(module, decorator.func.value)
+                route = static_string(module, decorator.args[0])
+                evidence = source_location(root, path, decorator)
+                if owner is None or route is None:
+                    dynamic.append(evidence + " ruta u objeto enrutador no resoluble")
+                    continue
+                methods = [method.upper()] if method in supported else ["GET"]
+                if method == "route":
+                    values = next((kw.value for kw in decorator.keywords if kw.arg == "methods"), None)
+                    if isinstance(values, (ast.List, ast.Tuple)):
+                        methods = [value.upper() for item in values.elts if (value := static_string(module, item)) and value.upper() in HTTP_METHODS]
+                dependency_nodes: list[ast.AST] = list(node.decorator_list)
+                dependency_nodes.extend(node.args.defaults)
+                dependency_nodes.extend(value for value in node.args.kw_defaults if value is not None)
+                endpoint_dependencies = dependency_symbols(module, dependency_nodes)
+                for route_method in methods:
+                    raw_operations.append((owner, route_method, route, (evidence,), endpoint_dependencies))
+
+    def prefixes(
+        owner: str,
+        trail: tuple[str, ...] = (),
+    ) -> list[tuple[str, tuple[str, ...], tuple[str, ...]]]:
+        if owner in dynamic_routers:
+            return []
+        if owner in trail:
+            dynamic.append(f"ciclo de inclusión de routers: {' -> '.join((*trail, owner))}")
+            return []
+        own_prefix, own_evidence = router_prefixes.get(owner, ("", owner + " (declaración implícita)"))
+        owner_parents = parents.get(owner, [])
+        if not owner_parents:
+            if owner in incomplete_includes or router_kinds.get(owner) == "router":
+                dynamic.append(own_evidence + " router sin inclusión estática resoluble")
+                return []
+            return [(own_prefix, (own_evidence,), router_dependencies.get(owner, ()))]
+        result: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+        for parent, include_prefix, include_evidence, include_dependencies in owner_parents:
+            for parent_prefix, evidence, parent_dependencies in prefixes(parent, (*trail, owner)):
+                dependencies = tuple(sorted(set((*parent_dependencies, *include_dependencies, *router_dependencies.get(owner, ())))))
+                result.append((join_route(parent_prefix, include_prefix, own_prefix), (*evidence, include_evidence, own_evidence), dependencies))
+        return result
+
+    operations: set[HttpOperation] = set()
+    findings: list[Finding] = []
+    rules_by_symbol: dict[str, list[AccessRule]] = {}
+    for rule in access_rules:
+        rules_by_symbol.setdefault(rule.symbol, []).append(rule)
+    for owner, method, route, endpoint_evidence, endpoint_dependencies in raw_operations:
+        for prefix, prefix_evidence, inherited_dependencies in prefixes(owner):
+            dependencies = tuple(sorted(set((*inherited_dependencies, *endpoint_dependencies))))
+            matched_rules = [rule for symbol in dependencies for rule in rules_by_symbol.get(symbol, [])]
+            accesses = {rule.access for rule in matched_rules}
+            access = next(iter(accesses)) if len(accesses) == 1 else "unknown"
+            adapter_evidence = tuple(
+                f"{ACCESS_ADAPTER_PATH} regla {rule.rule_id}: {rule.symbol} → {rule.access}; {rule.evidence}"
+                for rule in sorted(matched_rules, key=lambda item: item.rule_id)
+            )
+            if len(accesses) > 1:
+                findings.append(
+                    Finding(
+                        "NOT_EVALUATED",
+                        "api-access-adapter-conflict",
+                        f"Reglas de acceso incompatibles para {method} {join_route(prefix, route)}",
+                        (*prefix_evidence, *endpoint_evidence, *adapter_evidence),
+                        "UNRESOLVED",
+                    )
+                )
+            operations.add(
+                HttpOperation(
+                    method,
+                    join_route(prefix, route),
+                    access,
+                    (*layout.evidence, *prefix_evidence, *endpoint_evidence, *adapter_evidence),
+                    "CONFIRMED" if access != "unknown" else "UNRESOLVED",
+                    dependencies,
+                )
+            )
+    if dynamic:
+        findings.append(Finding("NOT_EVALUATED", "api-prefix-coverage", "Hay rutas o prefijos dinámicos que no se compusieron", tuple(sorted(set(dynamic))), "UNRESOLVED"))
+    return operations, findings, potential
+
+
+def detect_endpoints(root: Path, layout: ProjectLayout) -> tuple[set[HttpOperation], list[Finding], bool]:
+    found, findings, potential = detect_openapi(root)
+    marker = re.compile(r"MEMORY_ENDPOINT\s+(%s)\s+(\S+)(?:\s+(\S+))?" % "|".join(HTTP_METHODS), re.I)
+    decorator = re.compile(
+        r"(?:app|router|bp)\.(get|post|put|patch|delete|options|head)\(\s*['\"]([^'\"]+)['\"]",
+        re.I,
+    )
+    route_decorator = re.compile(r"(?:app|router|bp)\.route\(\s*['\"]([^'\"]+)['\"]([^)]*)\)", re.I)
+    access_rules, adapter_findings = load_access_rules(root)
+    findings.extend(adapter_findings)
+    python_found, python_findings, python_potential = detect_python_endpoints(root, layout, access_rules)
+    found.update(python_found)
+    findings.extend(python_findings)
+    potential = potential or python_potential
+    for path, raw in source_texts(root):
+        signal_text = python_signal_text(raw) if path.suffix.lower() == ".py" else raw
+        file_potential = bool(API_SIGNAL.search(signal_text))
+        potential = potential or file_potential
+        for match, line in marker_matches(path, raw, marker):
+            found.add(HttpOperation(match.group(1).upper(), match.group(2), match.group(3) or "unknown", (f"{path.relative_to(root).as_posix()}:{line} marcador MEMORY_ENDPOINT",)))
+        if path.suffix.lower() == ".py":
+            continue
+        for match in decorator.finditer(raw):
+            found.add(HttpOperation(match.group(1).upper(), match.group(2), "unknown", (path.relative_to(root).as_posix(),)))
+        for match in route_decorator.finditer(raw):
+            methods = re.search(r"methods\s*=\s*\[([^]]+)]", match.group(2), re.I)
+            route_methods = re.findall(r"['\"](%s)['\"]" % "|".join(HTTP_METHODS), methods.group(1), re.I) if methods else ["GET"]
+            for method in route_methods:
+                found.add(HttpOperation(method.upper(), match.group(1), "unknown", (path.relative_to(root).as_posix(),)))
+    return found, findings, potential
+
+
+def normalized_table_header(value: str) -> str:
+    clean = value.strip().strip("`").casefold()
+    clean = clean.translate(str.maketrans("áéíóúüñ", "aeiouun"))
+    return re.sub(r"[^a-z0-9]+", "_", clean).strip("_")
+
+
+def markdown_tables(path: Path) -> list[tuple[tuple[str, ...], list[dict[str, str]]]]:
+    raw = re.sub(r"<!--.*?-->", "", markdown_prose(text(path)), flags=re.S)
+    lines = raw.splitlines()
+    tables: list[tuple[tuple[str, ...], list[dict[str, str]]]] = []
+    index = 0
+    while index + 1 < len(lines):
+        header_line = lines[index].strip()
+        separator_line = lines[index + 1].strip()
+        if not (header_line.startswith("|") and separator_line.startswith("|")):
+            index += 1
+            continue
+        headers = tuple(normalized_table_header(cell) for cell in header_line.strip("|").split("|"))
+        separators = [cell.strip() for cell in separator_line.strip("|").split("|")]
+        if len(headers) != len(separators) or not all(re.fullmatch(r":?-{3,}:?", cell) for cell in separators):
+            index += 1
+            continue
+        records: list[dict[str, str]] = []
+        index += 2
+        while index < len(lines) and lines[index].strip().startswith("|"):
+            cells = [cell.strip().strip("`") for cell in lines[index].strip().strip("|").split("|")]
+            if len(cells) == len(headers):
+                records.append(dict(zip(headers, cells, strict=True)))
+            index += 1
+        tables.append((headers, records))
+    return tables
+
+
+def documented_endpoints(path: Path) -> tuple[set[DocumentedEndpoint], frozenset[str]]:
+    for headers, records in markdown_tables(path):
+        if {"metodo", "ruta", "acceso"}.issubset(headers):
+            operations = {
+                DocumentedEndpoint(
+                    record.get("metodo", "").upper(),
+                    record.get("ruta", ""),
+                    record.get("acceso", ""),
+                    normalized_table_header(record.get("tipo", "")),
+                    normalized_table_header(record.get("rol", "")),
+                    normalized_table_header(record.get("ciclo", "")),
+                    record.get("recurso_o_concepto", ""),
+                    record.get("modulo_propietario", ""),
+                    record.get("ruta_canonica", ""),
+                    record.get("proposito", record.get("descripcion", "")),
+                    record.get("decision", ""),
+                )
+                for record in records
+                if record.get("metodo", "").upper() in HTTP_METHODS and record.get("ruta")
+            }
+            return operations, frozenset(headers)
+    return set(), frozenset()
+
+
+def crud_records(path: Path) -> dict[str, dict[str, str]]:
+    required = {"recurso_o_concepto", "list", "create", "get", "update", "delete", "fuente_de_justificacion"}
+    for headers, records in markdown_tables(path):
+        if required.issubset(headers):
+            return {record["recurso_o_concepto"].casefold(): record for record in records if record["recurso_o_concepto"]}
+    return {}
+
+
+def detect_click_commands(raw: str) -> set[str]:
+    commands: set[str] = set()
+    try:
+        tree = ast.parse(raw)
+    except SyntaxError:
+        return commands
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            call = decorator if isinstance(decorator, ast.Call) else None
+            target = call.func if call else decorator
+            if not expression_name(target).endswith(".command"):
+                continue
+            explicit_name = None
+            if call:
+                for keyword in call.keywords:
+                    if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
+                        if isinstance(keyword.value.value, str):
+                            explicit_name = keyword.value.value
+            commands.add(explicit_name or node.name.replace("_", "-"))
+    return commands
+
+
+def detect_argparse_commands(raw: str) -> set[str]:
+    commands: set[str] = set()
+    try:
+        tree = ast.parse(raw)
+    except SyntaxError:
+        return commands
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not expression_name(node.func).endswith("add_parser"):
+            continue
+        if node.args:
+            command = constant_string(node.args[0])
+            if command:
+                commands.add(command)
+    return commands
+
+
+def detect_commands(root: Path) -> tuple[set[str], bool]:
+    found: set[str] = set()
+    potential = False
+    marker = re.compile(r"MEMORY_CLI_COMMAND\s+(\S+)")
+    parser = re.compile(r"add_parser\(\s*['\"]([^'\"]+)['\"]")
+    for path, raw in source_texts(root):
+        signal_text = python_signal_text(raw) if path.suffix.lower() == ".py" else raw
+        file_potential = bool(CLI_SIGNAL.search(signal_text))
+        potential = potential or file_potential
+        found.update(match.group(1) for match, _ in marker_matches(path, raw, marker))
+        if path.suffix.lower() == ".py":
+            if file_potential:
+                found.update(detect_argparse_commands(raw))
+                found.update(detect_click_commands(raw))
+        else:
+            found.update(parser.findall(raw))
+    return found, potential
+
+
+def command_is_documented(command: str, raw: str) -> bool:
+    pattern = re.compile(rf"(?<![\w-])`?{re.escape(command)}`?(?![\w-])")
+    return any(line.lstrip().startswith("|") and pattern.search(line) for line in raw.splitlines())
+
+
+def documented_token(value: str, raw: str) -> bool:
+    return bool(re.search(rf"(?<!\w){re.escape(value)}(?!\w)", raw, re.I))
+
+
+def context_is_indexed(relative_path: str, guide_raw: str) -> bool:
+    escaped = re.escape(relative_path)
+    return bool(
+        re.search(rf"`{escaped}`", guide_raw)
+        or re.search(rf"\[[^]]+]\(<?{escaped}(?:#[^)>]+)?(?:>|\))", guide_raw)
+    )
+
+
+def orm_class(node: ast.ClassDef) -> bool:
+    bases = {expression_name(base) for base in node.bases}
+    if "SQLModel" in bases:
+        table_flag = next((keyword.value for keyword in node.keywords if keyword.arg == "table"), None)
+        if isinstance(table_flag, ast.Constant) and table_flag.value is True:
+            return True
+    accepted_bases = {"DeclarativeBase", "db.Model", "models.Model"}
+    if bases & accepted_bases:
+        return True
+    for statement in node.body:
+        targets: list[ast.expr] = []
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+        elif isinstance(statement, ast.AnnAssign):
+            targets = [statement.target]
+        if any(isinstance(target, ast.Name) and target.id == "__tablename__" for target in targets):
+            return True
+    return False
+
+
+def class_table_name(node: ast.ClassDef) -> str:
+    for statement in node.body:
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target] if isinstance(statement, ast.AnnAssign) else []
+        if any(isinstance(target, ast.Name) and target.id == "__tablename__" for target in targets):
+            value = statement.value
+            literal = constant_string(value) if value is not None else None
+            if literal:
+                return literal
+    return node.name.casefold()
+
+
+def relationship_target(call: ast.Call) -> str | None:
+    if not call.args:
+        return None
+    value = call.args[0]
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return value.value.split(".")[-1]
+    if isinstance(value, ast.Name):
+        return value.id
+    return None
+
+
+def keyword_string(call: ast.Call, name: str) -> str | None:
+    value = next((keyword.value for keyword in call.keywords if keyword.arg == name), None)
+    return constant_string(value) if value is not None else None
+
+
+def foreign_key_references(call: ast.Call) -> list[str]:
+    call_name = expression_name(call.func).split(".")[-1]
+    if call_name == "Field":
+        value = keyword_string(call, "foreign_key")
+        return [value] if value else []
+    if call_name == "ForeignKey":
+        value = constant_string(call.args[0]) if call.args else None
+        return [value] if value else []
+    if call_name == "ForeignKeyConstraint" and len(call.args) >= 2 and isinstance(call.args[1], (ast.List, ast.Tuple)):
+        return [value for item in call.args[1].elts if (value := constant_string(item))]
+    references: list[str] = []
+    for child in ast.walk(call):
+        if child is call or not isinstance(child, ast.Call):
+            continue
+        child_name = expression_name(child.func).split(".")[-1]
+        if child_name in {"ForeignKey", "ForeignKeyConstraint"}:
+            references.extend(foreign_key_references(child))
+    return references
+
+
+def annotation_target(annotation: ast.expr | None) -> str | None:
+    if annotation is None:
+        return None
+    excluded = {
+        "Annotated",
+        "List",
+        "Mapped",
+        "None",
+        "Optional",
+        "Sequence",
+        "Set",
+        "Union",
+        "dict",
+        "frozenset",
+        "list",
+        "set",
+        "tuple",
+    }
+    strings = [
+        item.value
+        for item in ast.walk(annotation)
+        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+    ]
+    for value in strings:
+        candidates = re.findall(r"[A-Za-z_]\w*", value)
+        for candidate in reversed(candidates):
+            if candidate not in excluded:
+                return candidate
+    names = [item.id for item in ast.walk(annotation) if isinstance(item, ast.Name)]
+    for candidate in reversed(names):
+        if candidate not in excluded:
+            return candidate
+    return None
+
+
+def inspect_orm_class(
+    root: Path,
+    path: Path,
+    node: ast.ClassDef,
+    table_entities: dict[str, str],
+    entity_names: set[str],
+) -> tuple[set[ModelRelation], set[str], list[str]]:
+    relations: set[ModelRelation] = set()
+    fields: set[str] = set()
+    unresolved: list[str] = []
+    for statement in node.body:
+        target_name = None
+        value = None
+        annotation = None
+        if isinstance(statement, ast.Assign) and statement.targets:
+            if isinstance(statement.targets[0], ast.Name):
+                target_name = statement.targets[0].id
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            if isinstance(statement.target, ast.Name):
+                target_name = statement.target.id
+            value = statement.value
+            annotation = statement.annotation
+        if value is not None:
+            for constraint in (
+                child
+                for child in ast.walk(value)
+                if isinstance(child, ast.Call) and expression_name(child.func).endswith("ForeignKeyConstraint")
+            ):
+                local_fields = []
+                if constraint.args and isinstance(constraint.args[0], (ast.List, ast.Tuple)):
+                    local_fields = [item for element in constraint.args[0].elts if (item := constant_string(element))]
+                    fields.update(local_fields)
+                evidence = source_location(root, path, constraint)
+                for reference in foreign_key_references(constraint):
+                    table = reference.rsplit(".", 1)[0] if "." in reference else reference
+                    related = table_entities.get(table.casefold())
+                    if related:
+                        relations.add(ModelRelation(node.name, related, ", ".join(local_fields) or target_name, (f"{evidence} FK compuesta {reference}",)))
+                    else:
+                        unresolved.append(f"{evidence} FK compuesta {reference}: tabla destino no resuelta")
+        if not isinstance(value, ast.Call):
+            continue
+        call_name = expression_name(value.func)
+        if call_name.endswith(("Column", "mapped_column", "Field")) and target_name:
+            fields.add(target_name)
+        evidence = source_location(root, path, statement)
+        for reference in foreign_key_references(value):
+            table = reference.rsplit(".", 1)[0] if "." in reference else reference
+            related = table_entities.get(table.casefold())
+            if related:
+                relations.add(ModelRelation(node.name, related, target_name, (f"{evidence} FK {reference}",)))
+            else:
+                unresolved.append(f"{evidence} FK {reference}: tabla destino no resuelta")
+        relation_call = call_name.endswith(
+            ("relationship", "ForeignKey", "OneToOneField", "ManyToManyField")
+        )
+        if relation_call:
+            if target_name:
+                fields.add(target_name)
+            related = relationship_target(value) or annotation_target(annotation)
+            if related and related.casefold() == "self":
+                related = node.name
+            if related and related in entity_names:
+                relations.add(ModelRelation(node.name, related, target_name, (f"{evidence} {call_name}",)))
+            else:
+                rendered = related or "desconocida"
+                unresolved.append(f"{evidence} {call_name}: entidad destino {rendered} no resuelta")
+    return relations, fields, unresolved
+
+
+def detect_model(
+    root: Path,
+) -> tuple[set[str], set[ModelRelation], set[str], bool, tuple[str, ...], tuple[str, ...]]:
+    entities: set[str] = set()
+    relations: set[ModelRelation] = set()
+    fields: set[str] = set()
+    unresolved_relations: list[str] = []
+    potential = any(
+        path.suffix.lower() == ".prisma" and source_role(root, path) == "active"
+        for path in files(root, (".prisma",))
+    )
+    history: list[str] = []
+    historical_records = list(source_records(root, ("historical",)))
+    for record in historical_records:
+        signal_text = python_signal_text(record.raw) if record.path.suffix.lower() == ".py" else record.raw
+        if MODEL_SIGNAL.search(signal_text) or RELATION_SIGNAL.search(signal_text):
+            history.append(f"{record.path.relative_to(root).as_posix()}: evidencia histórica excluida del contrato activo")
+    python_models: list[tuple[Path, ast.ClassDef]] = []
+    table_entities: dict[str, str] = {}
+    for path, raw in source_texts(root):
+        if path.suffix.lower() != ".py":
+            continue
+        try:
+            tree = ast.parse(raw)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and orm_class(node):
+                python_models.append((path, node))
+                table_entities[class_table_name(node).casefold()] = node.name
+    entity_names = {node.name for _, node in python_models}
+    for path, raw in source_texts(root):
+        relation_count = len(relations)
+        entity_marker = re.compile(r"MEMORY_ENTITY\s+(\w+)")
+        relation_marker = re.compile(r"MEMORY_RELATION\s+(\w+)\s+(\w+)")
+        field_marker = re.compile(r"MEMORY_FIELD\s+(\w+)(?:\s+(\w+))?")
+        entities.update(match.group(1) for match, _ in marker_matches(path, raw, entity_marker))
+        for match, line in marker_matches(path, raw, relation_marker):
+            relations.add(ModelRelation(match.group(1), match.group(2), None, (f"{path.relative_to(root).as_posix()}:{line} marcador MEMORY_RELATION",)))
+        for match, _ in marker_matches(path, raw, field_marker):
+            fields.add(match.group(2) or match.group(1))
+        signal_text = python_signal_text(raw) if path.suffix.lower() == ".py" else raw
+        potential = potential or bool(MODEL_SIGNAL.search(signal_text))
+        if path.suffix.lower() != ".py":
+            if RELATION_SIGNAL.search(signal_text) and len(relations) == relation_count:
+                unresolved_relations.append(f"{path.relative_to(root).as_posix()}: relación en tecnología no soportada")
+            continue
+        for model_path, node in python_models:
+            if model_path != path:
+                continue
+            entities.add(node.name)
+            class_relations, class_fields, class_unresolved = inspect_orm_class(
+                root, path, node, table_entities, entity_names
+            )
+            relations.update(class_relations)
+            fields.update(class_fields)
+            entities.update(relation.target for relation in class_relations)
+            unresolved_relations.extend(class_unresolved)
+        if RELATION_SIGNAL.search(signal_text) and len(relations) == relation_count:
+            unresolved_relations.append(f"{path.relative_to(root).as_posix()}: señal de relación sin contrato resoluble")
+    entity_tables: dict[str, set[str]] = {}
+    for table, entity in table_entities.items():
+        entity_tables.setdefault(entity, set()).add(table)
+    corroborated_relations: set[ModelRelation] = set()
+    for relation in relations:
+        source_tokens = {relation.source.casefold(), *entity_tables.get(relation.source, set())}
+        target_tokens = {relation.target.casefold(), *entity_tables.get(relation.target, set())}
+        corroboration: list[str] = []
+        for record in historical_records:
+            lowered = record.raw.casefold()
+            signal_text = python_signal_text(record.raw) if record.path.suffix.lower() == ".py" else record.raw
+            if (
+                RELATION_SIGNAL.search(signal_text)
+                and any(token in lowered for token in source_tokens)
+                and any(token in lowered for token in target_tokens)
+            ):
+                corroboration.append(
+                    f"{record.path.relative_to(root).as_posix()}: CORROBORATING para {relation.source} → {relation.target}"
+                )
+        corroborated_relations.add(
+            ModelRelation(
+                relation.source,
+                relation.target,
+                relation.field,
+                (*relation.evidence, *sorted(set(corroboration))),
+                relation.confidence,
+                relation.source_role,
+            )
+        )
+    relations = corroborated_relations
+    return (
+        entities,
+        relations,
+        fields,
+        potential,
+        tuple(sorted(set(unresolved_relations))),
+        tuple(sorted(set(history))),
+    )
+
+
+def detect_layers(root: Path) -> tuple[set[str], set[str]]:
+    confirmed: set[str] = set()
+    candidates: set[str] = set()
+    marker = re.compile(r"MEMORY_LAYER\s+([A-Za-z][A-Za-z0-9_-]*)")
+    for path, raw in source_texts(root):
+        confirmed.update(match.group(1) for match, _ in marker_matches(path, raw, marker))
+    known = ("frontend", "backend", "infra", "infrastructure", "mobile", "web", "api", "worker")
+    for name in known:
+        paths = (root / name, root / "src" / name)
+        if any(path.is_dir() and not path.is_symlink() for path in paths):
+            candidates.add(name)
+    return confirmed, candidates - confirmed
+
+
+def detect_modules(root: Path) -> set[Path]:
+    result: set[Path] = set()
+    for base in (root / "src" / "modules", root / "app" / "modules"):
+        if base.is_dir() and not base.is_symlink():
+            result.update(path for path in base.iterdir() if path.is_dir() and not path.is_symlink())
+    for marker in files(root, (".json",)):
+        if marker.name == "module.json":
+            result.add(marker.parent)
+    return result
+
+
+def detect_frontend_module_roots(root: Path) -> tuple[Path, ...]:
+    candidates = (
+        root / "frontend" / "src" / "modules",
+        root / "web" / "src" / "modules",
+        root / "client" / "src" / "modules",
+    )
+    return tuple(path for path in candidates if path.is_dir() and not path.is_symlink())
+
+
+def markdown_headings(path: Path) -> set[tuple[int, str]]:
+    found: set[tuple[int, str]] = set()
+    fence_char: str | None = None
+    fence_length = 0
+    for line in text(path).splitlines():
+        leading_spaces = len(line) - len(line.lstrip(" "))
+        if line.startswith("\t") or leading_spaces >= 4:
+            continue
+        stripped = line[leading_spaces:]
+        fence_match = re.match(r"(`{3,}|~{3,})", stripped)
+        if fence_match:
+            marker = fence_match.group(1)
+            if fence_char is None:
+                fence_char = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_length:
+                fence_char = None
+                fence_length = 0
+            continue
+        if fence_char is not None:
+            continue
+        heading_match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", stripped)
+        if heading_match:
+            found.add((len(heading_match.group(1)), heading_match.group(2).casefold()))
+    return found
+
+
+def required_sections(
+    path: Path,
+    requirements: tuple[tuple[str, tuple[str, ...]], ...],
+) -> list[str]:
+    titles = [title for _, title in markdown_headings(path)]
+    return [
+        display
+        for display, patterns in requirements
+        if not any(re.search(pattern, title) for pattern in patterns for title in titles)
+    ]
+
+
+def required_context_sections(path: Path) -> list[str]:
+    return required_sections(
+        path,
+        (
+            ("## Propósito", (r"^propósito\b",)),
+            ("## Actores", (r"^actores\b",)),
+            ("## Reglas", (r"^reglas\b",)),
+            ("## Flujo", (r"^(?:flujo\b|interfaces?\s+y\s+flujo\b)",)),
+        ),
+    )
+
+
+def is_html_directive(comment: str) -> bool:
+    return bool(HTML_DIRECTIVE.match(comment.strip()))
+
+
+def markdown_prose(raw: str) -> str:
+    prose: list[str] = []
+    fence_char: str | None = None
+    fence_length = 0
+    for line in raw.splitlines():
+        leading_spaces = len(line) - len(line.lstrip(" "))
+        if line.startswith("\t") or (fence_char is None and leading_spaces >= 4):
+            continue
+        stripped = line[leading_spaces:]
+        fence_match = re.match(r"(`{3,}|~{3,})", stripped)
+        if fence_match:
+            marker = fence_match.group(1)
+            if fence_char is None:
+                fence_char = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_length:
+                fence_char = None
+                fence_length = 0
+            continue
+        if fence_char is None:
+            prose.append(line)
+    return "\n".join(prose)
+
+
+def placeholder_comment(comment: str) -> bool:
+    clean = comment.strip()
+    if clean.upper().startswith("PENDIENTE:") or is_html_directive(clean):
+        return False
+    return bool(
+        re.fullmatch(r"[A-Z][A-Z0-9_ -]*", clean)
+        or re.search(r"\b(?:TODO|TBD|PLACEHOLDER|REPLACE(?:_ME)?)\b", clean, re.I)
+    )
+
+
+def markdown_issues(root: Path, scope: ScopeContext) -> list[Finding]:
+    found: list[Finding] = []
+    link = re.compile(r"\[[^]]+]\((?!https?://|mailto:|#)([^)]+)\)")
+    html_comment = re.compile(r"<!--(.*?)-->", re.S)
+    mustache = re.compile(r"\{\{[A-Z][A-Z0-9_]*}}")
+    for path in files(root, (".md",)):
+        relative = path.relative_to(root).as_posix()
+        if scope.changed and relative not in scope.changed:
+            continue
+        scope.inspected.add(relative)
+        raw = text(path)
+        prose = markdown_prose(raw)
+        portable_reference = relative.startswith("docs/memoria-viva/")
+        if not portable_reference:
+            for match in html_comment.finditer(prose):
+                if not placeholder_comment(match.group(1)):
+                    continue
+                found.append(Finding("ERROR", "placeholder", f"Placeholder residual en {path.relative_to(root)}"))
+                break
+            if mustache.search(raw):
+                found.append(Finding("ERROR", "placeholder", f"Placeholder residual en {path.relative_to(root)}"))
+        for target in link.findall(prose):
+            clean = target.split("#", 1)[0].strip("<>")
+            if clean and not (path.parent / clean).resolve().exists():
+                found.append(Finding("ERROR", "broken-link", f"Enlace roto en {path.relative_to(root)}: {target}"))
+    return found
+
+
+def validate_prompts(root: Path) -> list[Finding]:
+    findings: list[Finding] = []
+    for rel in REQUIRED_PROMPTS:
+        path = root / rel
+        if not path.exists():
+            findings.append(Finding("ERROR", "prompt-file", f"Falta {rel}"))
+            continue
+        if path.is_symlink():
+            findings.append(Finding("ERROR", "unsafe-symlink", f"El prompt no puede ser symlink: {rel}"))
+            continue
+        raw = text(path)
+        words = re.findall(r"\b[\wáéíóúñüÁÉÍÓÚÑÜ-]+\b", raw)
+        if not re.search(r"(?m)^#\s+\S", raw) or len(words) < MIN_PROMPT_WORDS:
+            findings.append(Finding("ERROR", "prompt-content", f"Prompt base incompleto: {rel}"))
+    return findings
+
+
+def validate_standard_version(guide_raw: str, expected_value: str | None) -> list[Finding]:
+    findings: list[Finding] = []
+    adopted_line = re.search(r"(?im)^\s*-?\s*Versión adoptada:\s*(.*?)\s*$", guide_raw)
+    if not adopted_line:
+        return [Finding("ERROR", "standard-version", "Falta una versión SemVer adoptada en docs/guia_IA.md")]
+    adopted_raw = adopted_line.group(1).strip()
+    backticked = re.fullmatch(r"`([^`]+)`\.?", adopted_raw)
+    adopted_value = backticked.group(1) if backticked else adopted_raw
+    adopted = parse_semver(adopted_value)
+    if adopted is None:
+        return [Finding("ERROR", "standard-version", f"Versión adoptada no es SemVer estricto: {adopted_value}")]
+    if expected_value is None:
+        return [
+            Finding(
+                "NOT_EVALUATED",
+                "standard-expected-version",
+                "No se comparó la versión: falta --expected-standard-version",
+            )
+        ]
+    expected = parse_semver(expected_value)
+    if expected is None:
+        return [Finding("ERROR", "standard-expected-version", f"Versión esperada no es SemVer estricto: {expected_value}")]
+    comparison = compare_semver(adopted, expected)
+    if comparison < 0:
+        findings.append(
+            Finding("WARN", "standard-update", f"Versión adoptada {adopted_value}; proponer actualización a {expected_value}")
+        )
+    elif comparison > 0:
+        findings.append(
+            Finding(
+                "NOT_EVALUATED",
+                "standard-newer",
+                f"Versión adoptada {adopted_value} es posterior a {expected_value}; no proponer downgrade",
+            )
+        )
+    return findings
+
+
+def adopted_standard_version(guide_raw: str) -> SemanticVersion | None:
+    match = re.search(r"(?im)^\s*-?\s*Versión adoptada:\s*`?([^`\s]+)`?\.?\s*$", guide_raw)
+    return parse_semver(match.group(1)) if match else None
+
+
+def http_resource_design_applies(guide_raw: str, expected_value: str | None) -> bool:
+    versions = [adopted_standard_version(guide_raw)]
+    versions.append(parse_semver(expected_value) if expected_value else None)
+    return any(
+        version is not None and (version.major, version.minor, version.patch) >= HTTP_RESOURCE_DESIGN_SINCE
+        for version in versions
+    )
+
+
+def validate_crud_value(concept: str, operation: str, value: str) -> Finding | None:
+    normalized = value.strip().casefold()
+    if normalized == "aplica":
+        return None
+    if re.fullmatch(r"(?:no aplica|no permitida|pendiente):\s*\S.*", normalized):
+        return None
+    return Finding(
+        "ERROR",
+        "api-crud-justification",
+        f"{concept}: {operation} debe ser 'aplica' o registrar una omisión justificada",
+        ("docs/api.md",),
+        "CONFIRMED",
+    )
+
+
+def validate_http_resource_design(
+    root: Path,
+    api_doc: Path,
+    documented: set[DocumentedEndpoint],
+    headers: frozenset[str],
+) -> list[Finding]:
+    findings: list[Finding] = []
+    required_headers = {
+        "metodo",
+        "ruta",
+        "acceso",
+        "tipo",
+        "rol",
+        "ciclo",
+        "recurso_o_concepto",
+        "modulo_propietario",
+        "ruta_canonica",
+        "proposito",
+        "decision",
+    }
+    missing_headers = sorted(required_headers - set(headers))
+    if missing_headers:
+        findings.append(
+            Finding(
+                "ERROR",
+                "api-resource-structure",
+                "El inventario HTTP no tiene columnas 1.4: " + ", ".join(missing_headers),
+                ("docs/api.md",),
+                "CONFIRMED",
+            )
+        )
+        return findings
+
+    for heading in required_sections(
+        root / "docs/convenciones.md",
+        (("Diseño HTTP orientado a recursos", (r"^diseño\s+http\s+orientado\s+a\s+recursos\b",)),),
+    ):
+        findings.append(Finding("ERROR", "api-resource-convention", f"Falta sección '{heading}' en docs/convenciones.md"))
+    for heading in required_sections(
+        api_doc,
+        (("Matriz de aplicabilidad CRUD", (r"^matriz\s+de\s+aplicabilidad\s+crud\b",)),),
+    ):
+        findings.append(Finding("ERROR", "api-crud-structure", f"Falta sección '{heading}' en docs/api.md"))
+
+    for operation in sorted(documented, key=lambda item: (item.method, item.route)):
+        label = f"{operation.method} {operation.route}"
+        if operation.endpoint_type not in HTTP_RESOURCE_TYPES:
+            findings.append(Finding("ERROR", "api-resource-type", f"Tipo HTTP ausente o inválido: {label}"))
+        if operation.route_role not in HTTP_ROUTE_ROLES:
+            findings.append(Finding("ERROR", "api-route-role", f"Rol canónico/contextual ausente o inválido: {label}"))
+        if not operation.lifecycle:
+            findings.append(Finding("ERROR", "api-resource-lifecycle", f"Ciclo de vida no declarado: {label}"))
+        if not operation.owner_concept or not operation.owner_module:
+            findings.append(Finding("ERROR", "api-resource-owner", f"Propietario incompleto: {label}"))
+        if not operation.canonical_path:
+            code = "api-contextual-canonical" if operation.route_role == "contextual" else "api-canonical-path"
+            findings.append(Finding("ERROR", code, f"Ruta canónica ausente: {label}"))
+        if not operation.purpose:
+            findings.append(Finding("ERROR", "api-resource-purpose", f"Propósito ausente: {label}"))
+        if operation.endpoint_type == "accion" and not operation.decision:
+            findings.append(Finding("ERROR", "api-action-justification", f"Acción sin justificación: {label}"))
+        if operation.endpoint_type == "proyeccion" and operation.method in HTTP_MUTATION_METHODS and not operation.decision:
+            findings.append(Finding("ERROR", "api-projection-mutation", f"Mutación de proyección sin decisión explícita: {label}"))
+
+    crud = crud_records(api_doc)
+    crud_concepts = {
+        operation.owner_concept.casefold(): operation.owner_concept
+        for operation in documented
+        if operation.endpoint_type == "recurso"
+        or (operation.endpoint_type == "subrecurso" and operation.lifecycle == "propio")
+    }
+    for key, concept in sorted(crud_concepts.items()):
+        record = crud.get(key)
+        if record is None:
+            findings.append(Finding("ERROR", "api-crud-resource", f"Falta evaluación CRUD para {concept}"))
+            continue
+        for operation_name in ("list", "create", "get", "update", "delete"):
+            issue = validate_crud_value(concept, operation_name.title(), record.get(operation_name, ""))
+            if issue:
+                findings.append(issue)
+        if not record.get("fuente_de_justificacion", "").strip():
+            findings.append(Finding("ERROR", "api-crud-source", f"Falta fuente de decisión CRUD para {concept}"))
+
+    canonical_mutations: dict[str, set[tuple[str, str]]] = {}
+    for operation in documented:
+        if operation.route_role != "canonica" or operation.method not in HTTP_MUTATION_METHODS:
+            continue
+        canonical_mutations.setdefault(operation.owner_concept.casefold(), set()).add(
+            (operation.owner_module.casefold(), operation.canonical_path)
+        )
+    for concept, authorities in sorted(canonical_mutations.items()):
+        if concept and len(authorities) > 1:
+            findings.append(
+                Finding(
+                    "ERROR",
+                    "api-canonical-mutation-conflict",
+                    f"Hay más de una autoridad canónica de mutación declarada para {concept}",
+                    tuple(f"{module}: {path}" for module, path in sorted(authorities)),
+                    "CONFIRMED",
+                )
+            )
+
+    findings.append(
+        Finding(
+            "NOT_EVALUATED",
+            "api-resource-semantics",
+            "Clasificación, jerarquía, correspondencia con dominio/ORM, propiedad y aplicabilidad CRUD requieren revisión humana",
+            ("docs/api.md", "docs/convenciones.md"),
+            "UNRESOLVED",
+        )
+    )
+    return findings
+
+
+def validate_partial(root: Path, expected_version: str | None, scope: ScopeContext) -> list[Finding]:
+    """Validate only declared files/modules without claiming repository coverage."""
+    out: list[Finding] = []
+    guide = root / "docs/guia_IA.md"
+    changed_paths = {Path(item) for item in scope.changed}
+
+    for relative in sorted(scope.changed):
+        path = root / relative
+        if Path(relative).is_absolute() or relative.startswith("../") or "/../" in relative:
+            out.append(Finding("ERROR", "scope-path", f"Ruta fuera del proyecto: {relative}"))
+            continue
+        if not path.exists():
+            out.append(Finding("ERROR", "scope-file", f"Archivo declarado no existe: {relative}"))
+            continue
+        scope.inspected.add(relative)
+        if path.is_symlink():
+            out.append(Finding("ERROR", "unsafe-symlink", f"El archivo declarado no puede ser symlink: {relative}"))
+
+    if "docs/guia_IA.md" in scope.changed and guide.exists() and not guide.is_symlink():
+        scope.checks_executed.add("standard-version")
+        out.extend(validate_standard_version(text(guide), expected_version))
+
+    markdown_changed = {item for item in scope.changed if item.casefold().endswith(".md")}
+    if markdown_changed:
+        scope.checks_executed.add("markdown-scope")
+        out.extend(markdown_issues(root, scope))
+
+    selected_modules = {item.casefold() for item in scope.modules}
+    if selected_modules:
+        scope.checks_executed.add("module-context-scope")
+        detected = {module.name.casefold(): module for module in detect_modules(root)}
+        missing_modules = sorted(selected_modules - detected.keys())
+        for name in missing_modules:
+            out.append(Finding("ERROR", "scope-module", f"Módulo declarado no encontrado: {name}"))
+        for name in sorted(selected_modules & detected.keys()):
+            module = detected[name]
+            context = module / "context.md"
+            context_rel = context.relative_to(root).as_posix()
+            scope.inspected.add(context_rel)
+            if not context.exists():
+                out.append(Finding("ERROR", "module-context", f"Falta {context_rel}"))
+            elif not context_is_indexed(context_rel, text(guide)):
+                out.append(Finding("ERROR", "context-index", f"Contexto no indexado: {context_rel}"))
+            if context.exists():
+                for heading in required_context_sections(context):
+                    out.append(Finding("ERROR", "required-section", f"Falta sección '{heading}' en {context_rel}"))
+
+    non_markdown_changes = changed_paths - {Path(item) for item in markdown_changed}
+    if non_markdown_changes:
+        scope.checks_executed.add("declared-files")
+        for path in sorted(non_markdown_changes):
+            if path.as_posix() == "scripts/validate-project-memory" and not os.access(root / path, os.X_OK):
+                out.append(Finding("ERROR", "validator-executable", "No es ejecutable: scripts/validate-project-memory"))
+
+    scope.checks_skipped.update(
+        {
+            "http-detection",
+            "cli-detection",
+            "model-detection",
+            "layer-detection",
+            "global-base-artifacts",
+            "global-prompt-validation",
+        }
+    )
+    out.append(
+        Finding(
+            "NOT_EVALUATED",
+            "scope-partial",
+            "Ejecución parcial: los controles globales no se ejecutaron; no puede declararse conformidad global",
+            tuple(sorted(scope.checks_skipped)),
+            "UNRESOLVED",
+        )
+    )
+    return out
+
+
+def validate(root: Path, expected_version: str | None, scope: ScopeContext) -> list[Finding]:
+    if scope.partial:
+        return validate_partial(root, expected_version, scope)
+    out: list[Finding] = []
+    scope.checks_executed.update({"global-base-artifacts", "global-prompt-validation", "http-detection", "cli-detection", "model-detection", "layer-detection"})
+    for rel in BASE_FILES:
+        path = root / rel
+        if not path.exists():
+            out.append(Finding("ERROR", "base-file", f"Falta {rel}"))
+        elif path.is_symlink():
+            out.append(Finding("ERROR", "unsafe-symlink", f"El artefacto base no puede ser symlink: {rel}"))
+        elif rel == "scripts/validate-project-memory" and not os.access(path, os.X_OK):
+            out.append(Finding("ERROR", "validator-executable", f"No es ejecutable: {rel}"))
+    out.extend(validate_prompts(root))
+
+    guide = root / "docs/guia_IA.md"
+    guide_raw = text(guide)
+    out.extend(validate_standard_version(guide_raw, expected_version))
+
+    layout, layout_findings = discover_project_layout(root)
+    out.extend(layout_findings)
+    endpoints, endpoint_findings, api_potential = detect_endpoints(root, layout)
+    out.extend(endpoint_findings)
+    api_doc = root / "docs/api.md"
+    if endpoints and not api_doc.exists():
+        evidence = tuple(sorted({item for endpoint in endpoints for item in endpoint.evidence}))
+        out.append(Finding("ERROR", "api-required", "Hay endpoints HTTP y falta docs/api.md", evidence, "CONFIRMED"))
+    elif endpoints:
+        for heading in required_sections(
+            api_doc,
+            (("## Endpoints", (r"^(?:índice\s+de\s+)?endpoints\b",)),),
+        ):
+            out.append(Finding("ERROR", "required-section", f"Falta sección '{heading}' en docs/api.md"))
+        documented, endpoint_headers = documented_endpoints(api_doc)
+        exact = {(item.method, item.route, item.access) for item in endpoints if item.access != "unknown"}
+        source_pairs = {(item.method, item.route) for item in endpoints}
+        doc_pairs = {(item.method, item.route) for item in documented}
+        for method, route in sorted(source_pairs - doc_pairs):
+            evidence = tuple(sorted({line for item in endpoints if (item.method, item.route) == (method, route) for line in item.evidence}))
+            out.append(Finding("ERROR", "api-operation", f"Operación no inventariada: {method} {route}", evidence, "CONFIRMED"))
+        for method, route, access in sorted(exact):
+            matching = {
+                item.access for item in documented if (item.method, item.route) == (method, route)
+            }
+            if matching and access not in matching:
+                evidence = tuple(
+                    sorted(
+                        {
+                            line
+                            for item in endpoints
+                            if (item.method, item.route, item.access) == (method, route, access)
+                            for line in item.evidence
+                        }
+                    )
+                )
+                out.append(
+                    Finding(
+                        "ERROR",
+                        "api-access-drift",
+                        f"Acceso desactualizado: {method} {route}",
+                        evidence,
+                        "CONFIRMED",
+                    )
+                )
+        for method, route in sorted(doc_pairs - source_pairs):
+            out.append(Finding("WARN", "api-stale", f"Operación documentada no detectada: {method} {route}"))
+        known_access_pairs = {(item.method, item.route) for item in endpoints if item.access != "unknown"}
+        unknown_access_pairs = {
+            (item.method, item.route)
+            for item in endpoints
+            if item.access == "unknown" and (item.method, item.route) not in known_access_pairs
+        }
+        if unknown_access_pairs:
+            rendered = ", ".join(f"{method} {route}" for method, route in sorted(unknown_access_pairs))
+            out.append(
+                Finding(
+                    "NOT_EVALUATED",
+                    "api-access-coverage",
+                    f"No se evaluó el acceso de: {rendered}",
+                    tuple(sorted({line for item in endpoints if (item.method, item.route) in unknown_access_pairs for line in item.evidence})),
+                    "UNRESOLVED",
+                )
+            )
+        if http_resource_design_applies(guide_raw, expected_version):
+            out.extend(validate_http_resource_design(root, api_doc, documented, endpoint_headers))
+    elif api_potential and not any(item.code == "openapi-yaml-parser" for item in endpoint_findings):
+        out.append(Finding("NOT_EVALUATED", "api-coverage", "Hay señales de API, pero ningún endpoint soportado fue detectado"))
+    elif not api_potential:
+        out.append(Finding("N/A", "api", "No se detectaron señales de una interfaz HTTP"))
+        out.append(Finding("N/A", "api-resource-design", "La directiva HTTP orientada a recursos no aplica"))
+
+    if (
+        not endpoints
+        and api_potential
+        and api_doc.exists()
+        and http_resource_design_applies(guide_raw, expected_version)
+    ):
+        documented, endpoint_headers = documented_endpoints(api_doc)
+        out.extend(validate_http_resource_design(root, api_doc, documented, endpoint_headers))
+
+    commands, cli_potential = detect_commands(root)
+    cli_doc = root / "docs/cli.md"
+    if commands and not cli_doc.exists():
+        out.append(Finding("ERROR", "cli-required", "Hay comandos CLI y falta docs/cli.md"))
+    elif commands:
+        for heading in required_sections(
+            cli_doc,
+            (("## Comandos", (r"^(?:índice\s+de\s+)?comandos\b",)),),
+        ):
+            out.append(Finding("ERROR", "required-section", f"Falta sección '{heading}' en docs/cli.md"))
+        raw = text(cli_doc)
+        for command in sorted(commands):
+            if not command_is_documented(command, raw):
+                out.append(Finding("ERROR", "cli-command", f"Comando no inventariado: {command}"))
+        out.append(
+            Finding(
+                "NOT_EVALUATED",
+                "cli-contract-coverage",
+                "Argumentos, salida, códigos y efectos de la CLI requieren revisión semántica",
+            )
+        )
+    elif cli_potential:
+        out.append(Finding("NOT_EVALUATED", "cli-coverage", "Hay señales de CLI, pero ningún comando soportado fue detectado"))
+    else:
+        out.append(Finding("N/A", "cli", "No se detectaron señales de una interfaz CLI"))
+
+    entities, relations, fields, model_potential, unresolved_relations, model_history = detect_model(root)
+    model_doc = root / "docs/modelo-datos.md"
+    model_required = len(entities) >= 2 and bool(relations)
+    if model_required and not model_doc.exists():
+        evidence = tuple(sorted({line for relation in relations for line in relation.evidence}))
+        out.append(Finding("ERROR", "model-required", "Hay entidades relacionadas y falta docs/modelo-datos.md", evidence, "CONFIRMED"))
+    if model_doc.exists():
+        raw = text(model_doc)
+        model_sections = (
+            ("## Diagrama", (r"^diagrama\b",)),
+            ("## Diccionario", (r"^diccionario\b", r"^inventario\s+de\s+entidades\b")),
+        )
+        for heading in required_sections(model_doc, model_sections):
+            out.append(Finding("ERROR", "required-section", f"Falta sección '{heading}' en docs/modelo-datos.md"))
+        missing = sorted(entity for entity in entities if not documented_token(entity, raw))
+        if missing:
+            out.append(Finding("WARN", "model-entity-drift", "Entidades no documentadas: " + ", ".join(missing)))
+        missing_fields = sorted(field for field in fields if not documented_token(field, raw))
+        if missing_fields:
+            out.append(Finding("WARN", "model-field-drift", "Campos no documentados: " + ", ".join(missing_fields)))
+        for block in re.findall(r"```mermaid\s+erDiagram(.*?)```", raw, re.S | re.I):
+            for line in block.splitlines():
+                clean = line.strip()
+                relationship_line = any(token in clean for token in ("||", "}|", "o{", "|o", "}o"))
+                if clean and not relationship_line and not any(token in clean for token in ("PK", "FK", "{", "}")) and re.match(r"\w+\s+\w+", clean):
+                    out.append(Finding("ERROR", "er-attributes", "El ER global contiene atributos que no son PK/FK"))
+                    break
+        if model_required and not re.search(r"```mermaid\s+erDiagram\b", raw, re.I):
+            out.append(Finding("ERROR", "model-diagram", "Falta un diagrama Mermaid erDiagram global"))
+    if unresolved_relations:
+        out.append(
+            Finding(
+                "NOT_EVALUATED",
+                "model-relation-coverage",
+                "Hay relaciones de persistencia cuya entidad destino no pudo resolverse",
+                unresolved_relations,
+                "UNRESOLVED",
+            )
+        )
+    if model_history:
+        out.append(
+            Finding(
+                "N/A",
+                "model-history",
+                "Las migraciones se trataron como historia y no activaron el contrato vigente",
+                model_history,
+                "HISTORICAL",
+            )
+        )
+    if not model_required:
+        if model_potential and not entities:
+            out.append(
+                Finding("NOT_EVALUATED", "model-coverage", "Hay señales de persistencia, pero el modelo no pudo evaluarse")
+            )
+        elif not unresolved_relations:
+            out.append(Finding("N/A", "model", "No se detectó el umbral de dos entidades relacionadas"))
+
+    confirmed_layers, candidate_layers = detect_layers(root)
+    for layer in sorted(confirmed_layers):
+        if not (root / ".github/instructions" / f"{layer}.instructions.md").exists():
+            out.append(Finding("ERROR", "layer-instructions", f"Faltan instrucciones para la capa {layer}"))
+    for layer in sorted(candidate_layers):
+        if not (root / ".github/instructions" / f"{layer}.instructions.md").exists():
+            out.append(
+                Finding(
+                    "NOT_EVALUATED",
+                    "layer-candidate",
+                    f"La ruta sugiere la capa {layer}; confirmar su límite o crear instrucciones",
+                )
+            )
+
+    frontend_roots = detect_frontend_module_roots(root)
+    frontend_doc = root / "docs/frontend.md"
+    if not frontend_roots:
+        out.append(Finding("N/A", "frontend-module-structure", "No se detectó una raíz frontend convencional"))
+    elif not frontend_doc.exists():
+        out.append(
+            Finding(
+                "ERROR",
+                "frontend-documentation",
+                "Se detectó frontend y falta docs/frontend.md con su organización modular",
+                tuple(path.relative_to(root).as_posix() for path in frontend_roots),
+                "CONFIRMED",
+            )
+        )
+    else:
+        frontend_sections = (
+            ("## Organización del frontend", (r"^organización\s+del\s+frontend\b",)),
+            ("### Revisión de módulos frontend", (r"^revisión\s+de\s+módulos\s+frontend\b",)),
+        )
+        for heading in required_sections(frontend_doc, frontend_sections):
+            out.append(Finding("ERROR", "required-section", f"Falta sección '{heading}' en docs/frontend.md"))
+        for base in frontend_roots:
+            for module in sorted(path for path in base.iterdir() if path.is_dir() and not path.is_symlink()):
+                coordinator = module / "index.vue"
+                if coordinator.exists() and len(text(coordinator).splitlines()) > 300:
+                    out.append(
+                        Finding(
+                            "WARN",
+                            "frontend-module-composition",
+                            f"{coordinator.relative_to(root)} supera 300 líneas; revisar coordinación y subflujos",
+                            (coordinator.relative_to(root).as_posix(),),
+                            "CONFIRMED",
+                        )
+                    )
+
+    selected_modules = {item.casefold() for item in scope.modules}
+    for module in sorted(detect_modules(root)):
+        if selected_modules and module.name.casefold() not in selected_modules:
+            continue
+        context = module / "context.md"
+        rel = module.relative_to(root)
+        context_rel = context.relative_to(root).as_posix()
+        scope.inspected.add(context_rel)
+        if not context.exists():
+            out.append(Finding("ERROR", "module-context", f"Falta {rel}/context.md"))
+        elif not context_is_indexed(context_rel, guide_raw):
+            out.append(Finding("ERROR", "context-index", f"Contexto no indexado: {context_rel}"))
+        if context.exists():
+            for heading in required_context_sections(context):
+                out.append(Finding("ERROR", "required-section", f"Falta sección '{heading}' en {context.relative_to(root)}"))
+
+    section_sets = {
+        "docs/guia_IA.md": (
+            ("## Adopción del estándar", (r"^adopción\s+del\s+estándar\b",)),
+            ("## Contextos de módulos", (r"^contextos\s+de\s+módulos\b",)),
+        ),
+        "docs/arquitectura.md": (
+            ("## Stack", (r"^stack\b",)),
+            ("## Componentes", (r"^componentes\b",)),
+            ("## Flujo global", (r"^flujo\s+global\b",)),
+        ),
+        "docs/entorno.md": (
+            ("## Requisitos", (r"^requisitos\b",)),
+            ("## Servicios", (r"^servicios\b",)),
+            ("## Variables", (r"^variables\b",)),
+        ),
+        "docs/procedimientos.md": (
+            ("## Mantenimiento de memoria", (r"^mantenimiento\s+de\s+memoria\b",)),
+        ),
+    }
+    for rel, headings in section_sets.items():
+        path = root / rel
+        if path.exists():
+            for heading in required_sections(path, headings):
+                out.append(Finding("ERROR", "required-section", f"Falta sección '{heading}' en {rel}"))
+
+    out.extend(markdown_issues(root, scope))
+    blocking_levels = {"ERROR", "WARN", "NOT_EVALUATED"}
+    if not any(item.level in blocking_levels for item in out):
+        out.append(
+            Finding(
+                "OK",
+                "result",
+                "Los controles estructurales aplicables no encontraron brechas; la revisión semántica sigue siendo obligatoria",
+            )
+        )
+    return out
+
+
+def finding_counts(findings: list[Finding]) -> dict[str, int]:
+    return {
+        level: sum(item.level == level for item in findings)
+        for level in ("ERROR", "WARN", "NOT_EVALUATED", "N/A", "OK")
+    }
+
+
+def scope_payload(scope: ScopeContext) -> dict[str, object]:
+    return {
+        "profile": scope.profile,
+        "level": scope.level,
+        "modules": sorted(scope.modules),
+        "files_inspected": sorted(scope.inspected),
+        "files_changed": sorted(scope.changed),
+        "coverage": "partial" if scope.partial else "full",
+        "checks_executed": sorted(scope.checks_executed),
+        "checks_skipped": sorted(scope.checks_skipped),
+        "global_checks_executed": not scope.partial,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=DESCRIPTION)
+    parser.add_argument("root", nargs="?", default=".", help="Raíz del proyecto")
+    parser.add_argument(
+        "--expected-standard-version",
+        help="Versión SemVer normativa esperada; si se omite, la comparación queda NOT_EVALUATED",
+    )
+    parser.add_argument("--json", action="store_true", help="Emitir un único objeto JSON")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fallar también ante WARN o NOT_EVALUATED; solo endurece controles estructurales soportados",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("economical", "balanced", "exhaustive"),
+        default="economical",
+        help="Perfil de recursos declarado para la ejecución",
+    )
+    parser.add_argument(
+        "--level",
+        choices=("L0", "L1", "L2", "L3", "L4"),
+        help="Nivel operativo declarado para la ejecución",
+    )
+    parser.add_argument(
+        "--module",
+        action="append",
+        default=[],
+        help="Módulo declarado para el alcance de la ejecución",
+    )
+    parser.add_argument(
+        "--changed",
+        action="append",
+        default=[],
+        help="Archivo cambiado declarado; activa validación parcial y cobertura explícita",
+    )
+    args = parser.parse_args()
+    if args.expected_standard_version and parse_semver(args.expected_standard_version) is None:
+        parser.error("--expected-standard-version debe ser SemVer estricto")
+
+    root = Path(args.root).resolve()
+    scope = ScopeContext(
+        profile=args.profile,
+        level=args.level,
+        modules={item.casefold() for item in args.module},
+        changed={Path(item).as_posix() for item in args.changed},
+    )
+    findings = validate(root, args.expected_standard_version, scope)
+    counts = finding_counts(findings)
+    if args.json:
+        payload = {
+            "root": str(root),
+            "ir_schema_version": IR_SCHEMA_VERSION,
+            "access_adapter_schema_version": ACCESS_ADAPTER_SCHEMA_VERSION,
+            "expected_standard_version": args.expected_standard_version,
+            "strict": args.strict,
+            "scope": scope_payload(scope),
+            "findings": [asdict(item) for item in findings],
+            "summary": counts,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        for item in findings:
+            print(f"[{item.level}] {item.code}: {item.message}")
+            if item.confidence:
+                print(f"  Confianza: {item.confidence}")
+            for evidence in item.evidence:
+                print(f"  Evidencia: {evidence}")
+        print(
+            "Resumen: "
+            f"{counts['ERROR']} error(es), {counts['WARN']} advertencia(s), "
+            f"{counts['NOT_EVALUATED']} no evaluada(s), {counts['N/A']} no aplicable(s)"
+        )
+
+    failed = counts["ERROR"] > 0
+    if args.strict:
+        failed = failed or counts["WARN"] > 0 or counts["NOT_EVALUATED"] > 0
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

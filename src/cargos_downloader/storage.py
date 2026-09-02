@@ -11,6 +11,12 @@ from typing import Any
 SCHEMA_VERSION = 3
 INVALID_PATH_SEGMENT = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
+# MEMORY_ENTITY Document
+# MEMORY_ENTITY DocumentRelation
+# MEMORY_ENTITY FileDownload
+# MEMORY_RELATION Document DocumentRelation
+# MEMORY_RELATION Document FileDownload
+
 
 def safe_path_segment(value: str, fallback: str = "sin_usuario") -> str:
     text = INVALID_PATH_SEGMENT.sub("_", (value or "").strip())
