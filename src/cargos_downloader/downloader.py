@@ -132,6 +132,7 @@ def run_download(
     stopped: Callable[[], bool] | None = None,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> DownloadStats:
+    log("Preparando base local...")
     client = SgdApiClient(options.service_url, token=options.token, timeout=120)
     stats = DownloadStats()
     if not context_matches(
@@ -151,11 +152,13 @@ def run_download(
     fecha_hasta = f"{options.period}-12-31"
     master_documents: dict[int, dict[str, Any]] = {}
 
+    log(f"Consultando documentos: scope={options.scope}, depe_id={options.depe_id}, periodo={options.period}.")
     while True:
         if stopped and stopped():
             log("Descarga cancelada por el usuario.")
             break
 
+        log(f"Solicitando pagina {page}...")
         response = client.documents(
             scope=options.scope,
             depe_id=options.depe_id,

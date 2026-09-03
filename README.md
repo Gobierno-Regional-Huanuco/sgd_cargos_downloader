@@ -4,6 +4,33 @@ Aplicacion de escritorio en Python para registrar documentos emitidos desde la
 API `/api/cargos` del SGD, generar un Excel de registro y descargar sus
 archivos adjuntos.
 
+## Requisitos e instalacion inicial
+
+- Python 3.10 o superior, disponible en el `PATH`.
+- Git Bash o WSL si se va a ejecutar el validador de memoria
+  (`scripts/validate-project-memory`).
+
+Crear el entorno virtual la primera vez (Windows):
+
+```powershell
+cd D:\cargos_downloader
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+En Bash/Linux:
+
+```bash
+cd cargos_downloader
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Detalle completo, verificacion y pasos siguientes en
+[docs/procedimientos.md](docs/procedimientos.md#instalar-entorno-primera-vez).
+
 ## Desarrollo
 
 En Windows PowerShell:

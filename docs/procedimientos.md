@@ -7,6 +7,43 @@ Antes de modificar un flujo funcional, revisar [guia_IA.md](guia_IA.md) y el
 modelo de datos y contexto cuando cambie su comportamiento real. Ejecutar el
 validador y la compilación antes de cerrar el trabajo.
 
+## Instalar Entorno (Primera Vez)
+
+Requiere Python 3.10 o superior instalado y disponible en el `PATH` (ver
+[entorno.md](entorno.md)).
+
+En PowerShell (Windows):
+
+```powershell
+cd D:\cargos_downloader
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+En Bash/Linux o WSL:
+
+```bash
+cd cargos_downloader
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+El `.venv` es local a cada sistema operativo; no se comparte entre Windows y
+WSL. Verificar la instalacion:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import PySide6, requests; print('OK')"
+```
+
+Con el entorno creado, la app necesita ademas `sgd_service.json` con la URL del
+SGD (ver [entorno.md](entorno.md)); si falta, la aplicacion la pide al iniciar.
+Para verificar que el SGD configurado responde antes de abrir la interfaz, ver
+[pruebas-conexion-sgd.md](pruebas-conexion-sgd.md).
+
 ## Ejecutar En Desarrollo
 
 En PowerShell:

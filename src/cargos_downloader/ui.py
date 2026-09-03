@@ -815,8 +815,13 @@ class MainWindow(QMainWindow):
             self.worker.stop()
             self._append_log("Cancelando al finalizar la operación actual.")
 
-    def _download_completed(self, stats) -> None:
+    def _release_worker(self) -> None:
+        if self.worker:
+            self.worker.wait()
         self.worker = None
+
+    def _download_completed(self, stats) -> None:
+        self._release_worker()
         self._set_progress_done()
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
@@ -841,7 +846,7 @@ class MainWindow(QMainWindow):
         self.load_preview()
 
     def _file_download_completed(self, stats) -> None:
-        self.worker = None
+        self._release_worker()
         if stats.files_failed:
             self._set_progress_error()
         else:
@@ -873,7 +878,7 @@ class MainWindow(QMainWindow):
         self.progress.setFormat(f"{processed}/{total} - {label}")
 
     def _download_failed(self, message: str) -> None:
-        self.worker = None
+        self._release_worker()
         self._set_progress_error()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
@@ -1089,10 +1094,19 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         if self.worker and self.worker.isRunning():
             self.worker.stop()
-            self.worker.wait(3000)
+            if not self.worker.wait(60000):
+                self._append_log(
+                    "No se pudo cancelar la descarga en curso a tiempo; vuelva a cerrar la ventana."
+                )
+                event.ignore()
+                return
         for worker in list(self.preview_workers):
-            if worker.isRunning():
-                worker.wait(3000)
+            if worker.isRunning() and not worker.wait(60000):
+                self._append_log(
+                    "No se pudo cancelar la vista previa en curso a tiempo; vuelva a cerrar la ventana."
+                )
+                event.ignore()
+                return
         if self.client:
             self.client.logout()
         event.accept()
