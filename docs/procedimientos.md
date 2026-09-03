@@ -10,12 +10,14 @@ validador y la compilación antes de cerrar el trabajo.
 ## Instalar Entorno (Primera Vez)
 
 Requiere Python 3.10 o superior instalado y disponible en el `PATH` (ver
-[entorno.md](entorno.md)).
+[entorno.md](entorno.md)). En los comandos, `<ruta-del-proyecto>` es la
+carpeta donde se clono este repositorio; no depende de una unidad ni ruta
+fija.
 
 En PowerShell (Windows):
 
 ```powershell
-cd D:\cargos_downloader
+cd <ruta-del-proyecto>
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -25,7 +27,7 @@ python -m pip install -r requirements.txt
 En Bash/Linux o WSL:
 
 ```bash
-cd cargos_downloader
+cd <ruta-del-proyecto>
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -49,7 +51,7 @@ Para verificar que el SGD configurado responde antes de abrir la interfaz, ver
 En PowerShell:
 
 ```powershell
-cd D:\cargos_downloader
+cd <ruta-del-proyecto>
 .\.venv\Scripts\Activate.ps1
 $env:PYTHONPATH = "src"
 python -m cargos_downloader.main

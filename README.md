@@ -10,10 +10,13 @@ archivos adjuntos.
 - Git Bash o WSL si se va a ejecutar el validador de memoria
   (`scripts/validate-project-memory`).
 
+En los comandos, `<ruta-del-proyecto>` es la carpeta donde clonaste este
+repositorio (puede ser cualquiera, no depende de una unidad o ruta fija).
+
 Crear el entorno virtual la primera vez (Windows):
 
 ```powershell
-cd D:\cargos_downloader
+cd <ruta-del-proyecto>
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
@@ -22,7 +25,7 @@ python -m pip install -r requirements.txt
 En Bash/Linux:
 
 ```bash
-cd cargos_downloader
+cd <ruta-del-proyecto>
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -36,7 +39,7 @@ Detalle completo, verificacion y pasos siguientes en
 En Windows PowerShell:
 
 ```powershell
-cd D:\cargos_downloader
+cd <ruta-del-proyecto>
 .\.venv\Scripts\Activate.ps1
 $env:PYTHONPATH = "src"
 python -m cargos_downloader.main
@@ -45,14 +48,14 @@ python -m cargos_downloader.main
 Tambien puedes usar el script:
 
 ```powershell
-cd D:\cargos_downloader
+cd <ruta-del-proyecto>
 .\scripts\run_dev.ps1
 ```
 
 En Bash/Linux:
 
 ```bash
-cd cargos_downloader
+cd <ruta-del-proyecto>
 .venv/bin/python -m pip install -r requirements.txt
 PYTHONPATH=src .venv/bin/python -m cargos_downloader.main
 ```
