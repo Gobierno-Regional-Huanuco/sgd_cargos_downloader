@@ -111,22 +111,26 @@ class SgdApiClient:
         scope: str,
         depe_id: int,
         include_files: bool = True,
+        include_personal: bool = False,
         page: int = 1,
         per_page: int = 500,
         with_total: bool = False,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "scope": scope,
+            "depe_id": depe_id,
+            "document_ids": document_ids,
+            "include_files": int(include_files),
+            "page": page,
+            "per_page": per_page,
+            "with_total": int(with_total),
+        }
+        if include_personal:
+            payload["include_personal"] = 1
         return self._request(
             "POST",
             "api/cargos/documentos/relacionados/batch",
-            json={
-                "scope": scope,
-                "depe_id": depe_id,
-                "document_ids": document_ids,
-                "include_files": int(include_files),
-                "page": page,
-                "per_page": per_page,
-                "with_total": int(with_total),
-            },
+            json=payload,
         )
 
     def download_file(
@@ -137,11 +141,14 @@ class SgdApiClient:
         scope: str,
         depe_id: int,
         master_id: int | None = None,
+        include_personal: bool = False,
         progress: Callable[[int], None] | None = None,
     ) -> None:
         params: dict[str, Any] = {"scope": scope, "depe_id": depe_id}
         if master_id:
             params["master_id"] = master_id
+        if include_personal:
+            params["include_personal"] = 1
 
         url = self._url(f"api/cargos/archivos/{file_id}/download")
         response = self._send_with_retries("GET", url, params=params, stream=True)

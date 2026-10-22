@@ -48,6 +48,17 @@ adjuntos de forma reanudable.
 10. `Reg. SGD` es la ultima columna del reporte y conserva directamente
     `iddocumento` para facilitar cruces y calculos, sin modificar la cantidad ni
     el orden de las filas.
+11. Cuando el alcance oficina incluye documentos personales, la exportacion
+    genera un libro de oficina, otro de manuales/externos —incluidos los de
+    interoperabilidad/PIDE— y un libro por cada usuario con documentos
+    personales. La clasificacion usa `docu_origen` y `docu_tipo`; un
+    `docu_tipo` nulo se interpreta como `0` y permanece en el libro de oficina.
+    Los personales con `docu_tipo=1` se agrupan por `docu_idusuario`, con respaldo
+    temporal en `oper_idusuario` solo cuando el primero esta ausente o es nulo,
+    y usan el firmante solo como etiqueta del archivo. Nunca mezcla registros
+    cuya clasificacion o usuario no pueda determinarse. Si encuentra datos
+    invalidos, informa cantidades y una muestra de IDs por cada causa; el mismo
+    detalle queda en el log de la aplicacion.
 
 ## Estados Operativos
 

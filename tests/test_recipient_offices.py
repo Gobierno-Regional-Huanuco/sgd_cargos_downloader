@@ -7,11 +7,17 @@ import unittest
 import zipfile
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+from cargos_downloader.api import SgdApiClient
 from cargos_downloader.excel_exporter import (
     export_report,
+    export_report_files,
+    manual_report_path,
+    personal_report_path,
     preview_sheets,
     related_preview_rows,
+    report_path,
 )
 from cargos_downloader.storage import (
     SCHEMA_VERSION,
@@ -253,6 +259,160 @@ class RecipientOfficesTests(unittest.TestCase):
         self.assertIn("Reg. SGD", sheet)
         self.assertIn("<t>100</t>", sheet)
 
+    def test_office_export_separates_office_external_and_each_personal_user(self) -> None:
+        upsert_documents(
+            self.db_path,
+            [
+                self._document(201, document_origin=1, document_kind=0),
+                self._document(212, document_origin=1, document_kind=None),
+                self._document(
+                    202,
+                    document_origin=1,
+                    document_kind=1,
+                    document_user_id=30,
+                    operation_user_id=999,
+                    signer="ANA PEREZ",
+                ),
+                self._document(
+                    203,
+                    document_origin=1,
+                    document_kind=1,
+                    operation_user_id=30,
+                    signer="ANA PEREZ",
+                ),
+                self._document(
+                    204,
+                    document_origin=1,
+                    document_kind=1,
+                    document_user_id=40,
+                    signer="LUIS ROJAS",
+                ),
+                self._document(205, document_origin=2),
+                self._document(206, document_origin=3),
+            ],
+            period=2026,
+            scope="oficina",
+            depe_id=10,
+        )
+
+        reports = export_report_files(
+            self.db_path,
+            self.root,
+            period=2026,
+            scope="oficina",
+            depe_id=10,
+            separate_personal=True,
+        )
+
+        office_file = report_path(self.root, period=2026, scope="oficina", depe_id=10)
+        manual_file = manual_report_path(
+            self.root,
+            period=2026,
+            scope="oficina",
+            depe_id=10,
+        )
+        ana_file = personal_report_path(
+            self.root,
+            period=2026,
+            scope="oficina",
+            depe_id=10,
+            user_id="30",
+            signer="ANA PEREZ",
+        )
+        luis_file = personal_report_path(
+            self.root,
+            period=2026,
+            scope="oficina",
+            depe_id=10,
+            user_id="40",
+            signer="LUIS ROJAS",
+        )
+        self.assertEqual(
+            reports,
+            [(office_file, 2), (manual_file, 2), (ana_file, 2), (luis_file, 1)],
+        )
+        with zipfile.ZipFile(office_file) as workbook:
+            office_sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        with zipfile.ZipFile(manual_file) as workbook:
+            manual_sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        with zipfile.ZipFile(ana_file) as workbook:
+            ana_sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        with zipfile.ZipFile(luis_file) as workbook:
+            luis_sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        self.assertIn("ASUNTO 201", office_sheet)
+        self.assertIn("ASUNTO 212", office_sheet)
+        self.assertNotIn("ASUNTO 202", office_sheet)
+        self.assertIn("ASUNTO 205", manual_sheet)
+        self.assertIn("ASUNTO 206", manual_sheet)
+        self.assertIn("ASUNTO 202", ana_sheet)
+        self.assertIn("ASUNTO 203", ana_sheet)
+        self.assertNotIn("ASUNTO 204", ana_sheet)
+        self.assertIn("ASUNTO 204", luis_sheet)
+        self.assertNotIn("ASUNTO 202", luis_sheet)
+
+    def test_include_personal_is_propagated_to_batch_and_file_download(self) -> None:
+        client = SgdApiClient("https://sgd.example/")
+        with patch.object(client, "_request", return_value={}) as request:
+            client.related_documents_batch(
+                [1],
+                scope="oficina",
+                depe_id=10,
+                include_personal=True,
+            )
+        self.assertEqual(request.call_args.kwargs["json"]["include_personal"], 1)
+
+        response = Mock(status_code=200)
+        response.iter_content.return_value = []
+        destination = self.root / "archivo.pdf"
+        with patch.object(client, "_send_with_retries", return_value=response) as send:
+            client.download_file(
+                50,
+                destination,
+                scope="oficina",
+                depe_id=10,
+                include_personal=True,
+            )
+        self.assertEqual(send.call_args.kwargs["params"]["include_personal"], 1)
+
+    def test_separate_export_reports_each_invalid_classification_cause(self) -> None:
+        upsert_documents(
+            self.db_path,
+            [
+                self._document(207, document_kind=0),
+                self._document(208, document_origin=1),
+                self._document(209, document_origin=1, document_kind=7),
+                self._document(210, document_origin=1, document_kind=1),
+                self._document(
+                    211,
+                    document_origin=1,
+                    document_kind=1,
+                    operation_user_id="NO NUMERICO",
+                ),
+            ],
+            period=2026,
+            scope="oficina",
+            depe_id=10,
+        )
+        with self.assertRaises(ValueError) as raised:
+            export_report_files(
+                self.db_path,
+                self.root,
+                period=2026,
+                scope="oficina",
+                depe_id=10,
+                separate_personal=True,
+            )
+        message = str(raised.exception)
+        self.assertIn("5 documento(s)", message)
+        self.assertIn("docu_origen ausente o vacío: 1. Reg. SGD: 207.", message)
+        self.assertIn("docu_tipo ausente", message)
+        self.assertIn("docu_tipo no reconocido (7)", message)
+        self.assertIn("docu_idusuario y oper_idusuario ausentes o vacíos", message)
+        self.assertIn("Reg. SGD: 210.", message)
+        self.assertIn("oper_idusuario no es numérico", message)
+        self.assertIn("Reg. SGD: 211.", message)
+        self.assertIn("app.log", message)
+
     def test_schema_migration_backfills_report_fields_from_raw_json(self) -> None:
         self._create_version_3_database()
 
@@ -287,6 +447,11 @@ class RecipientOfficesTests(unittest.TestCase):
         document_type: str = "OFICIO",
         document_date: object = ...,
         acronyms: object = ...,
+        document_origin: object = ...,
+        document_kind: object = ...,
+        document_user_id: object = ...,
+        operation_user_id: object = ...,
+        signer: object = ...,
     ) -> dict[str, object]:
         document: dict[str, object] = {
             "iddocumento": document_id,
@@ -308,6 +473,16 @@ class RecipientOfficesTests(unittest.TestCase):
             document["docu_fecha_doc"] = document_date
         if acronyms is not ...:
             document["docu_siglas_doc"] = acronyms
+        if document_origin is not ...:
+            document["docu_origen"] = document_origin
+        if document_kind is not ...:
+            document["docu_tipo"] = document_kind
+        if document_user_id is not ...:
+            document["docu_idusuario"] = document_user_id
+        if operation_user_id is not ...:
+            document["oper_idusuario"] = operation_user_id
+        if signer is not ...:
+            document["docu_firma"] = signer
         return document
 
     def _create_version_3_database(self) -> None:

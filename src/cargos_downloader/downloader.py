@@ -167,7 +167,9 @@ def run_download(
             fecha_desde=fecha_desde,
             fecha_hasta=fecha_hasta,
             include_files=True,
-            include_personal=options.include_personal_for_office,
+            include_personal=(
+                options.scope == "oficina" and options.include_personal_for_office
+            ),
             with_total=page == 1,
         )
         if page == 1:
@@ -250,6 +252,9 @@ def _sync_related_batches(
                     scope=options.scope,
                     depe_id=options.depe_id,
                     include_files=True,
+                    include_personal=(
+                        options.scope == "oficina" and options.include_personal_for_office
+                    ),
                     page=page,
                     per_page=related_page_size,
                     with_total=page == 1,
@@ -524,6 +529,9 @@ def run_file_download(
                     scope=options.scope,
                     depe_id=options.depe_id,
                     master_id=task["master_id"],
+                    include_personal=(
+                        options.scope == "oficina" and options.include_personal_for_office
+                    ),
                 )
                 stats.files_downloaded += 1
                 mark_file_download(

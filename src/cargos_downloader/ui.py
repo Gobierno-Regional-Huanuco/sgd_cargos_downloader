@@ -39,11 +39,10 @@ from cargos_downloader.api import SgdApiClient, SgdApiError
 from cargos_downloader.config import APP_DIR, AppConfig, load_config, save_config
 from cargos_downloader.downloader import DownloadOptions, run_download, run_file_download
 from cargos_downloader.excel_exporter import (
-    export_report,
+    export_report_files,
     preview_sheets,
     related_count,
     related_preview_rows,
-    report_path,
 )
 from cargos_downloader.storage import (
     clear_database,
@@ -755,27 +754,26 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Exportar Excel", f"No existe la base local: {db_path}")
             return
 
-        excel_file = report_path(
-            output,
-            period=self.config.period,
-            scope=self.scope_combo.currentData(),
-            depe_id=int(office["depe_id"]),
-        )
         try:
-            records = export_report(
+            reports = export_report_files(
                 db_path,
-                excel_file,
+                output,
                 period=self.config.period,
                 scope=self.scope_combo.currentData(),
                 depe_id=int(office["depe_id"]),
+                separate_personal=(
+                    self.scope_combo.currentData() == "oficina"
+                    and self.config.include_personal_for_office
+                ),
             )
         except Exception as exc:
             QMessageBox.critical(self, "Exportar Excel", str(exc))
             self._append_log(f"Error exportando Excel: {exc}")
             return
 
-        self._append_log(f"Excel generado: {excel_file}")
-        self._append_log(f"Registros exportados: {records}.")
+        for excel_file, records in reports:
+            self._append_log(f"Excel generado: {excel_file}")
+            self._append_log(f"Registros exportados: {records}.")
         self.load_preview()
 
     def clear_local_database(self) -> None:

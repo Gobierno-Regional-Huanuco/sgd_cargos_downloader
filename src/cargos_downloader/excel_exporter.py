@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import zipfile
@@ -9,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from cargos_downloader.storage import init_database
+from cargos_downloader.storage import init_database, safe_path_segment
 
 
 REPORT_COLUMNS = [
@@ -35,6 +36,27 @@ def report_path(output_dir: Path, *, period: int, scope: str, depe_id: int) -> P
     return output_dir / f"registro_documentos_{period}_{scope}_{depe_id}.xlsx"
 
 
+def manual_report_path(output_dir: Path, *, period: int, scope: str, depe_id: int) -> Path:
+    return output_dir / f"registro_documentos_manuales_externos_{period}_{scope}_{depe_id}.xlsx"
+
+
+def personal_report_path(
+    output_dir: Path,
+    *,
+    period: int,
+    scope: str,
+    depe_id: int,
+    user_id: str,
+    signer: str,
+) -> Path:
+    safe_user_id = safe_path_segment(user_id, "sin_id")
+    safe_signer = safe_path_segment(signer, "sin_firmante")[:80]
+    return output_dir / (
+        f"registro_documentos_personales_usuario_{safe_user_id}_{safe_signer}_"
+        f"{period}_{scope}_{depe_id}.xlsx"
+    )
+
+
 def export_report(db_path: Path, output_file: Path, *, period: int, scope: str, depe_id: int) -> int:
     init_database(db_path)
     rows = _load_rows(db_path, period=period, scope=scope, depe_id=depe_id)
@@ -42,6 +64,77 @@ def export_report(db_path: Path, output_file: Path, *, period: int, scope: str, 
     sheets = _build_sheets(rows, period)
     _write_xlsx(output_file, sheets)
     return len(rows)
+
+
+def export_report_files(
+    db_path: Path,
+    output_dir: Path,
+    *,
+    period: int,
+    scope: str,
+    depe_id: int,
+    separate_personal: bool = False,
+) -> list[tuple[Path, int]]:
+    output_file = report_path(output_dir, period=period, scope=scope, depe_id=depe_id)
+    if not separate_personal or scope != "oficina":
+        count = export_report(
+            db_path,
+            output_file,
+            period=period,
+            scope=scope,
+            depe_id=depe_id,
+        )
+        return [(output_file, count)]
+
+    init_database(db_path)
+    rows = _load_rows(db_path, period=period, scope=scope, depe_id=depe_id)
+    classified: list[tuple[sqlite3.Row, tuple[str, str | None]]] = []
+    classification_issues: dict[str, list[int]] = defaultdict(list)
+    for row in rows:
+        classification, issue = _document_classification(row)
+        if issue:
+            classification_issues[issue].append(int(row["iddocumento"]))
+        elif classification:
+            classified.append((row, classification))
+    if classification_issues:
+        raise ValueError(_classification_error_message(classification_issues))
+
+    office_rows = [row for row, classification in classified if classification == ("office", None)]
+    external_rows = [
+        row for row, classification in classified if classification == ("external", None)
+    ]
+    personal_rows: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row, classification in classified:
+        if classification and classification[0] == "personal":
+            personal_rows[classification[1] or ""].append(row)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_xlsx(output_file, _build_sheets(office_rows, period))
+    reports = [(output_file, len(office_rows))]
+
+    manual_file = manual_report_path(
+        output_dir,
+        period=period,
+        scope=scope,
+        depe_id=depe_id,
+    )
+    _write_xlsx(manual_file, _build_sheets(external_rows, period))
+    reports.append((manual_file, len(external_rows)))
+
+    for user_id in sorted(personal_rows, key=lambda value: (value.casefold(), value)):
+        user_rows = personal_rows[user_id]
+        signer = _personal_signer(user_rows)
+        personal_file = personal_report_path(
+            output_dir,
+            period=period,
+            scope=scope,
+            depe_id=depe_id,
+            user_id=user_id,
+            signer=signer,
+        )
+        _write_xlsx(personal_file, _build_sheets(user_rows, period))
+        reports.append((personal_file, len(user_rows)))
+    return reports
 
 
 def preview_sheets(
@@ -166,7 +259,7 @@ def _load_rows(db_path: Path, *, period: int, scope: str, depe_id: int) -> list[
                        p.document_date,
                        p.signer, p.subject, p.recipient_offices, p.expediente_documento, p.folios,
                        p.storage_type, p.observations, COUNT(rel.related_id) AS related_count,
-                       p.project_cui, p.procedure_type_description
+                       p.project_cui, p.procedure_type_description, p.raw_json
                 FROM documents AS p
                 LEFT JOIN document_relations AS rel
                   ON rel.master_id = p.iddocumento
@@ -181,6 +274,97 @@ def _load_rows(db_path: Path, *, period: int, scope: str, depe_id: int) -> list[
                 (period, scope, depe_id),
             )
         )
+
+
+def _document_classification(
+    row: sqlite3.Row,
+) -> tuple[tuple[str, str | None] | None, str | None]:
+    try:
+        document = json.loads(row["raw_json"])
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return None, "JSON original inválido"
+    if not isinstance(document, dict):
+        return None, "JSON original no es un objeto"
+
+    origin_value = document.get("docu_origen")
+    if origin_value is None or not str(origin_value).strip():
+        return None, "docu_origen ausente o vacío"
+    try:
+        origin = int(origin_value)
+    except (TypeError, ValueError):
+        return None, "docu_origen no es numérico"
+    if origin in (2, 3):
+        return ("external", None), None
+    if origin != 1:
+        return None, f"docu_origen no reconocido ({origin})"
+
+    if "docu_tipo" not in document:
+        return None, "docu_tipo ausente para docu_origen=1"
+    kind_value = document["docu_tipo"]
+    if kind_value is None:
+        kind = 0
+    else:
+        if not str(kind_value).strip():
+            return None, "docu_tipo vacío para docu_origen=1"
+        try:
+            kind = int(kind_value)
+        except (TypeError, ValueError):
+            return None, "docu_tipo no es numérico para docu_origen=1"
+    if kind == 0:
+        return ("office", None), None
+    if kind != 1:
+        return None, f"docu_tipo no reconocido ({kind}) para docu_origen=1"
+
+    user_id = document.get("docu_idusuario")
+    user_id_field = "docu_idusuario"
+    if user_id is None:
+        user_id = document.get("oper_idusuario")
+        user_id_field = "oper_idusuario"
+    if user_id is None or not str(user_id).strip():
+        return None, (
+            "docu_idusuario y oper_idusuario ausentes o vacíos en documento personal"
+        )
+    if isinstance(user_id, bool):
+        return None, f"{user_id_field} no es un identificador válido"
+    try:
+        user_id_number = int(user_id)
+    except (TypeError, ValueError):
+        return None, f"{user_id_field} no es numérico en documento personal"
+    if user_id_number <= 0:
+        return None, f"{user_id_field} no es positivo en documento personal"
+    return ("personal", str(user_id_number)), None
+
+
+def _classification_error_message(issues: dict[str, list[int]]) -> str:
+    total = sum(len(document_ids) for document_ids in issues.values())
+    lines = [
+        f"No se pudo exportar: {total} documento(s) tienen datos de clasificación inválidos.",
+        "",
+        "Detalle:",
+    ]
+    for reason, document_ids in issues.items():
+        sample = ", ".join(str(document_id) for document_id in document_ids[:10])
+        remaining = len(document_ids) - 10
+        suffix = f" y {remaining} más" if remaining > 0 else ""
+        lines.append(
+            f"- {reason}: {len(document_ids)}. Reg. SGD: {sample}{suffix}."
+        )
+    lines.extend(
+        [
+            "",
+            "Vuelva a descargar los registros si el SGD ya corrigió esos campos.",
+            "Este detalle también se guardó en Detalle de acciones y app.log.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _personal_signer(rows: list[sqlite3.Row]) -> str:
+    names = sorted(
+        {str(row["signer"]).strip() for row in rows if str(row["signer"] or "").strip()},
+        key=str.casefold,
+    )
+    return names[0] if names else "sin_firmante"
 
 
 def _load_preview_groups(

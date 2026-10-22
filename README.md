@@ -148,6 +148,9 @@ filas por hoja; el Excel exporta todos los registros principales.
 - La columna `Firmante` se muestra junto al numero de documento y usa `docu_firma`.
 - El Excel exporta solo documentos principales y agrega una columna
   `Relacionados` con la cantidad de documentos vinculados.
+- Al incluir documentos personales en el alcance de oficina, la exportacion
+  genera un Excel de oficina, otro de manuales/externos e interoperabilidad/PIDE
+  y un Excel por cada usuario que tenga documentos personales.
 - La base SQLite se limpia automaticamente cuando cambia el contexto de
   descarga: periodo, alcance u oficina.
 - Los documentos relacionados se consultan por lotes con
