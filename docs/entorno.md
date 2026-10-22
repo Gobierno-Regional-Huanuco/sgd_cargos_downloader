@@ -42,6 +42,24 @@ El destino por defecto es `Downloads\cargos_sgd`. Cada contexto contiene las
 bases SQLite, el Excel y los adjuntos. Las claves y tokens viven solo en memoria;
 el log local no debe imprimirlos.
 
+## Version Y Distribucion
+
+La version publica de la aplicacion tiene una unica fuente en
+`src/cargos_downloader/__init__.py` y sigue Versionado Semantico. Las versiones
+previas a una exposicion estable usan el sufijo `-rc.N`.
+
+El empaquetado Windows incorpora esa version en las propiedades del ejecutable
+y genera en `dist/releases`:
+
+```text
+SGD-Cargos-Downloader-{version}-win64.zip
+SGD-Cargos-Downloader-{version}-win64.sha256.txt
+```
+
+El ZIP contiene el ejecutable, `sgd_service.json` y `CHANGELOG.md`. El archivo
+de configuracion se distribuye para instalaciones nuevas; una actualizacion no
+debe sobrescribir el que ya usa cada instalacion.
+
 ## Integracion Externa
 
 El SGD debe estar disponible en la URL configurada y exponer `/api/cargos`.

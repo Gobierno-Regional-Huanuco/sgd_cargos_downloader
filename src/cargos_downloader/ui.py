@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from cargos_downloader import __version__
 from cargos_downloader.api import SgdApiClient, SgdApiError
 from cargos_downloader.config import APP_DIR, AppConfig, load_config, save_config
 from cargos_downloader.downloader import DownloadOptions, run_download, run_file_download
@@ -275,7 +276,7 @@ class MainWindow(QMainWindow):
         self.preview_request_id = 0
         self.preview_sheets_data: list[tuple[str, int, list[list[object]]]] = []
 
-        self.setWindowTitle("SGD Cargos Downloader")
+        self.setWindowTitle(f"SGD Cargos Downloader {__version__}")
         self.resize(900, 680)
         self._build_ui()
         self._load_config_values()

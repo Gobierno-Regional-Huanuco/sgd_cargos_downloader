@@ -66,6 +66,13 @@ El script equivalente es `./scripts/run_dev.ps1`. En Linux o WSL se usa
 .\scripts\build_windows.ps1
 ```
 
+Si el entorno virtual ya tiene las dependencias verificadas y la construccion
+debe ejecutarse sin consultar la red:
+
+```powershell
+.\scripts\build_windows.ps1 -SkipDependencyInstall
+```
+
 La distribucion requiere ambos archivos de `dist`:
 
 ```text
@@ -75,6 +82,38 @@ sgd_service.json
 
 Antes de entregar, abrir el ejecutable en una carpeta limpia, verificar que
 solicita una URL si falta el JSON y comprobar que puede guardar una URL valida.
+El script tambien genera un paquete versionado y su checksum en
+`dist\releases`.
+
+## Publicar Una Version
+
+1. Definir la version en `src/cargos_downloader/__init__.py` usando SemVer.
+   Usar `-rc.N` mientras sea una version candidata.
+2. Registrar los cambios de la version en `CHANGELOG.md`.
+3. Ejecutar las validaciones tecnicas y la prueba manual minima.
+4. Ejecutar `scripts\build_windows.ps1` en una copia limpia del repositorio.
+5. Abrir el ejecutable generado y confirmar que el titulo y las propiedades de
+   Windows muestran la version esperada.
+6. Verificar el ZIP contra el archivo `.sha256.txt` con `Get-FileHash`.
+7. Crear un tag Git anotado con el mismo numero, por ejemplo
+   `v0.1.0-rc.1`, solo sobre el commit validado.
+8. Entregar primero a validacion interna, despues al piloto autorizado y
+   finalmente al grupo general cuando el candidato sea aprobado.
+
+No reutilizar una version ni reemplazar sus artefactos una vez distribuidos. Si
+aparece una correccion, incrementar `rc`, `patch`, `minor` o `major` segun el
+impacto y construir un paquete nuevo.
+
+## Actualizar Y Revertir
+
+Para actualizar una instalacion existente, cerrar la aplicacion, conservar
+`sgd_service.json` y las carpetas de datos locales, respaldar el ejecutable
+anterior y reemplazar unicamente `SGD-Cargos-Downloader.exe`.
+
+Si la validacion falla, cerrar la aplicacion y restaurar el ejecutable anterior.
+No restaurar una base SQLite antigua sobre una base ya migrada: las migraciones
+del esquema local avanzan y su compatibilidad debe verificarse como parte de
+cada release.
 
 ## Validacion Tecnica
 

@@ -87,6 +87,9 @@ dist\SGD-Cargos-Downloader.exe
 ```
 
 El empaquetado deja tambien `dist\sgd_service.json`. Distribuir ambos archivos en la misma carpeta.
+Ademas genera en `dist\releases` un ZIP con version y su checksum SHA-256. El
+procedimiento de publicacion y retroceso esta en
+[docs/procedimientos.md](docs/procedimientos.md#publicar-una-version).
 
 ## Salidas
 
