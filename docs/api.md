@@ -43,6 +43,11 @@ recurso local gestionado por esta aplicacion.
   conserva solo como identificador interno. Valores nulos, vacios o ausentes
   dejan la celda correspondiente vacia y no excluyen el documento; un CUI cero
   tampoco se presenta.
+- Los documentos principales y relacionados incluyen `docu_numero_doc`,
+  `docu_fecha_doc`, `docu_siglas_doc` y `tdoc_descripcion`. El consumidor usa
+  estos campos para presentar la numeracion compuesta; `docu_siglas_doc` puede
+  ser nulo y, en ese caso, se conserva la numeracion correlativa sin inventar
+  siglas.
 - Los relacionados se consultan por lotes de IDs, paginados. Cada fila debe
   incluir `master_id`; `meta.related_total` representa el total del lote y no
   solo la pagina.

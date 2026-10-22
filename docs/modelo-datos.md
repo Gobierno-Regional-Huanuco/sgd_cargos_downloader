@@ -58,6 +58,10 @@ valor nulo, vacio o ausente se guarda como texto vacio para el reporte.
 campos opcionales `cui_proyecto`, `tipo_tramite` y
 `tipo_tramite_descripcion`. Solo CUI y la descripcion legible se exportan; el
 identificador del tipo de tramite permanece interno.
+`document_number` conserva el correlativo normalizado a seis digitos y
+`document_acronyms` conserva `docu_siglas_doc`. El tipo y la fecha ya
+normalizados permiten construir la numeracion visible sin modificar el
+correlativo usado para cruces con reportes anteriores.
 
 Indices relevantes: reporte por contexto/tipo/fecha/numero, principales por
 contexto y relacionados por principal.

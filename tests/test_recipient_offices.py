@@ -8,8 +8,17 @@ import zipfile
 from contextlib import closing
 from pathlib import Path
 
-from cargos_downloader.excel_exporter import export_report, preview_sheets
-from cargos_downloader.storage import SCHEMA_VERSION, init_database, upsert_documents
+from cargos_downloader.excel_exporter import (
+    export_report,
+    preview_sheets,
+    related_preview_rows,
+)
+from cargos_downloader.storage import (
+    SCHEMA_VERSION,
+    init_database,
+    upsert_documents,
+    upsert_related_records,
+)
 
 
 class RecipientOfficesTests(unittest.TestCase):
@@ -53,6 +62,8 @@ class RecipientOfficesTests(unittest.TestCase):
         self.assertEqual(rows[3][5], "")
         self.assertEqual(rows[4][5], "")
         self.assertEqual(rows[5][5], "")
+        for row in rows[1:]:
+            self.assertEqual(row[1], row[-1])
 
     def test_excel_wraps_and_preserves_long_recipient_text(self) -> None:
         offices = "GERENCIA DE ADMINISTRACION, OFICINA DE CONTABILIDAD, OFICINA DE TESORERIA"
@@ -81,7 +92,7 @@ class RecipientOfficesTests(unittest.TestCase):
         self.assertIn('min="5" max="5" width="48"', sheet)
         self.assertIn('wrapText="1"', styles)
 
-    def test_cui_and_procedure_type_are_the_last_report_columns(self) -> None:
+    def test_cui_and_procedure_type_precede_correlative_column(self) -> None:
         documents = [
             self._document(1, cui=2468101, procedure_type_id=4, procedure_type="EJECUCION DE OBRA"),
             self._document(2, cui=None, procedure_type_id=None, procedure_type=None),
@@ -122,11 +133,12 @@ class RecipientOfficesTests(unittest.TestCase):
                 "Relacionados",
                 "CUI",
                 "Tipo de trámite",
+                "Número correlativo",
             ],
         )
-        self.assertEqual(rows[1][-2:], ["2468101", "EJECUCION DE OBRA"])
+        self.assertEqual(rows[1][-3:], ["2468101", "EJECUCION DE OBRA", "000001"])
         for row in rows[2:]:
-            self.assertEqual(row[-2:], ["", ""])
+            self.assertEqual(row[-3:-1], ["", ""])
         with closing(sqlite3.connect(self.db_path)) as connection:
             stored_id = connection.execute(
                 "SELECT procedure_type_id FROM documents WHERE iddocumento = 1"
@@ -150,8 +162,74 @@ class RecipientOfficesTests(unittest.TestCase):
         self.assertIn("EJECUCION DE OBRA", sheet)
         self.assertIn('min="12" max="12" width="14"', sheet)
         self.assertIn('min="13" max="13" width="28"', sheet)
-        self.assertIn('mergeCell ref="M1"', sheet)
-        self.assertIn('mergeCell ref="M3"', sheet)
+        self.assertIn('mergeCell ref="N1"', sheet)
+        self.assertIn('mergeCell ref="N3"', sheet)
+
+    def test_composite_number_and_correlative_apply_to_main_and_related_reports(self) -> None:
+        principal = self._document(
+            100,
+            number=635,
+            document_type="MEMORANDUM MULTIPLE",
+            document_date="2026-10-20",
+            acronyms="GRH/GGR",
+        )
+        related = self._document(
+            101,
+            number=27,
+            document_type="INFORME",
+            document_date="2026-02-03",
+            acronyms="GRH/ORA",
+        )
+        upsert_documents(
+            self.db_path,
+            [principal],
+            period=2026,
+            scope="oficina",
+            depe_id=10,
+        )
+        upsert_related_records(
+            self.db_path,
+            [(related, 100)],
+            period=2026,
+            scope="oficina",
+            depe_id=10,
+        )
+
+        main_rows = preview_sheets(
+            self.db_path,
+            period=2026,
+            scope="oficina",
+            depe_id=10,
+        )[0][2]
+        related_rows = related_preview_rows(
+            self.db_path,
+            master_id=100,
+            period=2026,
+            scope="oficina",
+            depe_id=10,
+        )
+
+        self.assertEqual(main_rows[1][1], "MEMORANDUM MULTIPLE 000635-2026-GRH/GGR")
+        self.assertEqual(main_rows[1][-1], "000635")
+        self.assertEqual(related_rows[1][1], "INFORME 000027-2026-GRH/ORA")
+        self.assertEqual(related_rows[1][-1], "000027")
+
+        output = self.root / "numbering-report.xlsx"
+        self.assertEqual(
+            export_report(
+                self.db_path,
+                output,
+                period=2026,
+                scope="oficina",
+                depe_id=10,
+            ),
+            1,
+        )
+        with zipfile.ZipFile(output) as workbook:
+            sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        self.assertIn("MEMORANDUM MULTIPLE 000635-2026-GRH/GGR", sheet)
+        self.assertIn("Número correlativo", sheet)
+        self.assertIn("<t>000635</t>", sheet)
 
     def test_schema_migration_backfills_report_fields_from_raw_json(self) -> None:
         self._create_version_3_database()
@@ -162,14 +240,17 @@ class RecipientOfficesTests(unittest.TestCase):
             row = connection.execute(
                 """
                 SELECT recipient_offices, project_cui, procedure_type_id,
-                       procedure_type_description
+                       procedure_type_description, document_acronyms
                 FROM documents WHERE iddocumento = 1
                 """
             ).fetchone()
             version = connection.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-        self.assertEqual(row, ("OFICINA DE TESORERIA", "2468101", 4, "EJECUCION DE OBRA"))
+        self.assertEqual(
+            row,
+            ("OFICINA DE TESORERIA", "2468101", 4, "EJECUCION DE OBRA", "GRH/GGR"),
+        )
         self.assertEqual(version, (str(SCHEMA_VERSION),))
 
     @staticmethod
@@ -180,14 +261,19 @@ class RecipientOfficesTests(unittest.TestCase):
         cui: object = ...,
         procedure_type_id: object = ...,
         procedure_type: object = ...,
+        number: object = ...,
+        document_type: str = "OFICIO",
+        document_date: object = ...,
+        acronyms: object = ...,
     ) -> dict[str, object]:
         document: dict[str, object] = {
             "iddocumento": document_id,
             "iddocumento_text": str(document_id).zfill(8),
-            "tdoc_descripcion": "OFICIO",
+            "tdoc_descripcion": document_type,
             "docu_asunto": f"ASUNTO {document_id}",
             "files": [],
         }
+        document["docu_numero_doc"] = document_id if number is ... else number
         if offices is not ...:
             document["oficinas_destinatarias"] = offices
         if cui is not ...:
@@ -196,6 +282,10 @@ class RecipientOfficesTests(unittest.TestCase):
             document["tipo_tramite"] = procedure_type_id
         if procedure_type is not ...:
             document["tipo_tramite_descripcion"] = procedure_type
+        if document_date is not ...:
+            document["docu_fecha_doc"] = document_date
+        if acronyms is not ...:
+            document["docu_siglas_doc"] = acronyms
         return document
 
     def _create_version_3_database(self) -> None:
@@ -206,6 +296,8 @@ class RecipientOfficesTests(unittest.TestCase):
                 cui=2468101,
                 procedure_type_id=4,
                 procedure_type="EJECUCION DE OBRA",
+                document_date="2026-10-20",
+                acronyms="GRH/GGR",
             )
         )
         with closing(sqlite3.connect(self.db_path)) as connection:

@@ -1022,6 +1022,7 @@ class MainWindow(QMainWindow):
             self.preview_table.setColumnWidth(11, 90)
             self.preview_table.setColumnWidth(12, 110)
             self.preview_table.setColumnWidth(13, 220)
+            self.preview_table.setColumnWidth(14, 140)
         finally:
             self.preview_table.setUpdatesEnabled(True)
         self.related_button.setEnabled(bool(data_rows))

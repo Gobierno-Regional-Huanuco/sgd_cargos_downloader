@@ -26,6 +26,7 @@ REPORT_COLUMNS = [
     "Relacionados",
     "CUI",
     "Tipo de trámite",
+    "Número correlativo",
 ]
 
 
@@ -86,7 +87,8 @@ def related_preview_rows(
         rows = list(
             connection.execute(
                 f"""
-                SELECT d.iddocumento, d.document_type, d.document_number, d.document_date,
+                SELECT d.iddocumento, d.document_type, d.document_number, d.document_acronyms,
+                       d.document_date,
                        d.signer, d.subject, d.addressee, d.expediente_documento,
                        d.folios, d.storage_type, d.observations
                 FROM document_relations AS rel
@@ -115,11 +117,12 @@ def related_preview_rows(
         "Fisico/Digital",
         "Digital",
         "Observaciones",
+        "Número correlativo",
     ]
     data = [
         [
             row["document_type"] or "",
-            row["document_number"] or "",
+            _full_document_number(row),
             row["signer"] or "",
             _format_date(row["document_date"]),
             row["subject"] or "",
@@ -129,6 +132,7 @@ def related_preview_rows(
             row["storage_type"] or "",
             "",
             row["observations"] or "",
+            row["document_number"] or "",
         ]
         for row in rows
     ]
@@ -155,7 +159,8 @@ def _load_rows(db_path: Path, *, period: int, scope: str, depe_id: int) -> list[
         return list(
             connection.execute(
                 """
-                SELECT p.iddocumento, p.document_type, p.document_number, p.document_date,
+                SELECT p.iddocumento, p.document_type, p.document_number, p.document_acronyms,
+                       p.document_date,
                        p.signer, p.subject, p.recipient_offices, p.expediente_documento, p.folios,
                        p.storage_type, p.observations, COUNT(rel.related_id) AS related_count,
                        p.project_cui, p.procedure_type_description
@@ -212,7 +217,8 @@ def _load_preview_groups(
                         WHERE period = ? AND scope = ? AND depe_id = ?
                         GROUP BY master_id
                     )
-                    SELECT p.iddocumento, p.document_type, p.document_number, p.document_date,
+                    SELECT p.iddocumento, p.document_type, p.document_number, p.document_acronyms,
+                           p.document_date,
                            p.signer, p.subject, p.recipient_offices, p.expediente_documento, p.folios,
                            p.storage_type, p.observations,
                            COALESCE(rc.related_count, 0) AS related_count,
@@ -244,9 +250,9 @@ def _load_preview_groups(
 def _build_sheets(rows: list[sqlite3.Row], period: int) -> list[tuple[str, list[list[object]], list[tuple[int, int, str]]]]:
     grouped = _group_rows(rows, period)
     if not grouped:
-        return [("Sin registros", _sheet_rows("SIN REGISTROS", period, []), [(1, 1, "M1"), (3, 3, "M3")])]
+        return [("Sin registros", _sheet_rows("SIN REGISTROS", period, []), [(1, 1, "N1"), (3, 3, "N3")])]
 
-    sheets = [(name, _sheet_rows(document_type, period, grouped_rows), [(1, 1, "M1"), (3, 3, "M3")]) for name, document_type, grouped_rows in grouped]
+    sheets = [(name, _sheet_rows(document_type, period, grouped_rows), [(1, 1, "N1"), (3, 3, "N3")]) for name, document_type, grouped_rows in grouped]
     return sheets
 
 
@@ -277,7 +283,7 @@ def _sheet_rows(document_type: str, period: int, rows: list[sqlite3.Row]) -> lis
 
 def _report_row(row: sqlite3.Row) -> list[object]:
     return [
-        row["document_number"] or "",
+        _full_document_number(row),
         row["signer"] or "",
         _format_date(row["document_date"]),
         row["subject"] or "",
@@ -290,6 +296,7 @@ def _report_row(row: sqlite3.Row) -> list[object]:
         row["related_count"] or "",
         row["project_cui"] or "",
         row["procedure_type_description"] or "",
+        row["document_number"] or "",
     ]
 
 
@@ -342,6 +349,7 @@ def _worksheet_xml(rows: list[list[object]], merges: list[tuple[int, int, str]])
         '<col min="11" max="11" width="12" customWidth="1"/>'
         '<col min="12" max="12" width="14" customWidth="1"/>'
         '<col min="13" max="13" width="28" customWidth="1"/>'
+        '<col min="14" max="14" width="18" customWidth="1"/>'
         '</cols>'
         f'<sheetData>{"".join(xml_rows)}</sheetData>'
         f"{merge_xml}"
@@ -481,6 +489,17 @@ def _format_date(value: str | None) -> str:
         return datetime.strptime(text, "%Y-%m-%d").strftime("%d/%m/%Y")
     except ValueError:
         return text
+
+
+def _full_document_number(row: sqlite3.Row) -> str:
+    number = str(row["document_number"] or "")
+    document_type = str(row["document_type"] or "").strip()
+    acronyms = str(row["document_acronyms"] or "").strip()
+    date_text = str(row["document_date"] or "").strip()
+    year_match = re.match(r"^(\d{4})", date_text)
+    if not number or not document_type or not acronyms or not year_match:
+        return number
+    return f"{document_type} {number}-{year_match.group(1)}-{acronyms}"
 
 
 def _record_type(value: str | None) -> str:

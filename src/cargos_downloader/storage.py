@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 INVALID_PATH_SEGMENT = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
 # MEMORY_ENTITY Document
@@ -270,6 +270,7 @@ def init_database(path: Path) -> None:
                 master_id INTEGER,
                 document_type TEXT NOT NULL,
                 document_number TEXT,
+                document_acronyms TEXT,
                 signer TEXT,
                 document_date TEXT,
                 subject TEXT,
@@ -371,6 +372,11 @@ def _migrate_database(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE documents ADD COLUMN procedure_type_description TEXT")
         columns.add("procedure_type_description")
         report_fields_added = True
+    document_acronyms_added = False
+    if "document_acronyms" not in columns:
+        connection.execute("ALTER TABLE documents ADD COLUMN document_acronyms TEXT")
+        columns.add("document_acronyms")
+        document_acronyms_added = True
 
     version_row = connection.execute(
         "SELECT value FROM metadata WHERE key = 'schema_version'"
@@ -457,6 +463,20 @@ def _migrate_database(connection: sqlite3.Connection) -> None:
                 """,
                 updates,
             )
+    if document_acronyms_added or current_version < 6:
+        rows = connection.execute("SELECT iddocumento, raw_json FROM documents").fetchall()
+        updates = []
+        for document_id, raw_json in rows:
+            try:
+                document = json.loads(raw_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            updates.append((_document_acronyms(document), document_id))
+        if updates:
+            connection.executemany(
+                "UPDATE documents SET document_acronyms = ? WHERE iddocumento = ?",
+                updates,
+            )
 
 
 def upsert_document(
@@ -483,13 +503,15 @@ def upsert_document(
             """
             INSERT INTO documents (
                 iddocumento, period, scope, depe_id, relation_kind, master_id,
-                document_type, document_number, signer, document_date, subject, addressee, recipient_offices,
+                document_type, document_number, document_acronyms, signer, document_date, subject,
+                addressee, recipient_offices,
                 project_cui, procedure_type_id, procedure_type_description,
                 expediente_documento, folios, storage_type, observations, file_count, raw_json, synced_at
             )
             VALUES (
                 :iddocumento, :period, :scope, :depe_id, :relation_kind, :master_id,
-                :document_type, :document_number, :signer, :document_date, :subject, :addressee, :recipient_offices,
+                :document_type, :document_number, :document_acronyms, :signer, :document_date, :subject,
+                :addressee, :recipient_offices,
                 :project_cui, :procedure_type_id, :procedure_type_description,
                 :expediente_documento, :folios, :storage_type, :observations, :file_count,
                 :raw_json, CURRENT_TIMESTAMP
@@ -510,6 +532,7 @@ def upsert_document(
                 END,
                 document_type = excluded.document_type,
                 document_number = excluded.document_number,
+                document_acronyms = excluded.document_acronyms,
                 signer = excluded.signer,
                 document_date = excluded.document_date,
                 subject = excluded.subject,
@@ -579,13 +602,15 @@ def upsert_document_records(
             """
             INSERT INTO documents (
                 iddocumento, period, scope, depe_id, relation_kind, master_id,
-                document_type, document_number, signer, document_date, subject, addressee, recipient_offices,
+                document_type, document_number, document_acronyms, signer, document_date, subject,
+                addressee, recipient_offices,
                 project_cui, procedure_type_id, procedure_type_description,
                 expediente_documento, folios, storage_type, observations, file_count, raw_json, synced_at
             )
             VALUES (
                 :iddocumento, :period, :scope, :depe_id, :relation_kind, :master_id,
-                :document_type, :document_number, :signer, :document_date, :subject, :addressee, :recipient_offices,
+                :document_type, :document_number, :document_acronyms, :signer, :document_date, :subject,
+                :addressee, :recipient_offices,
                 :project_cui, :procedure_type_id, :procedure_type_description,
                 :expediente_documento, :folios, :storage_type, :observations, :file_count,
                 :raw_json, CURRENT_TIMESTAMP
@@ -606,6 +631,7 @@ def upsert_document_records(
                 END,
                 document_type = excluded.document_type,
                 document_number = excluded.document_number,
+                document_acronyms = excluded.document_acronyms,
                 signer = excluded.signer,
                 document_date = excluded.document_date,
                 subject = excluded.subject,
@@ -676,13 +702,15 @@ def upsert_related_records(
             """
             INSERT INTO documents (
                 iddocumento, period, scope, depe_id, relation_kind, master_id,
-                document_type, document_number, signer, document_date, subject, addressee, recipient_offices,
+                document_type, document_number, document_acronyms, signer, document_date, subject,
+                addressee, recipient_offices,
                 project_cui, procedure_type_id, procedure_type_description,
                 expediente_documento, folios, storage_type, observations, file_count, raw_json, synced_at
             )
             VALUES (
                 :iddocumento, :period, :scope, :depe_id, :relation_kind, :master_id,
-                :document_type, :document_number, :signer, :document_date, :subject, :addressee, :recipient_offices,
+                :document_type, :document_number, :document_acronyms, :signer, :document_date, :subject,
+                :addressee, :recipient_offices,
                 :project_cui, :procedure_type_id, :procedure_type_description,
                 :expediente_documento, :folios, :storage_type, :observations, :file_count,
                 :raw_json, CURRENT_TIMESTAMP
@@ -703,6 +731,7 @@ def upsert_related_records(
                 END,
                 document_type = excluded.document_type,
                 document_number = excluded.document_number,
+                document_acronyms = excluded.document_acronyms,
                 signer = excluded.signer,
                 document_date = excluded.document_date,
                 subject = excluded.subject,
@@ -756,6 +785,7 @@ def normalize_document(
         "master_id": master_id,
         "document_type": _first_text(document, "tdoc_descripcion", "tipo_documento", default="SIN TIPO"),
         "document_number": _document_number(document),
+        "document_acronyms": _document_acronyms(document),
         "signer": _signer(document),
         "document_date": _first_text(document, "docu_fecha_doc", "fecha_documento", "created_at"),
         "subject": _first_text(document, "docu_asunto", "asunto"),
@@ -781,6 +811,10 @@ def _document_number(document: dict[str, Any]) -> str:
         return str(int(number)).zfill(6)
     except (TypeError, ValueError):
         return str(number)
+
+
+def _document_acronyms(document: dict[str, Any]) -> str:
+    return _first_text(document, "docu_siglas_doc")
 
 
 def _addressee(document: dict[str, Any]) -> str:

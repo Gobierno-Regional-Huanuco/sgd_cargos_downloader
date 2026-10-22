@@ -36,10 +36,15 @@ adjuntos de forma reanudable.
 7. El reporte muestra `oficinas_destinatarias` tal como lo entrega el SGD en
    una sola celda por documento. Un valor nulo, vacio o ausente deja la celda
    vacia y nunca oculta el documento ni se reemplaza con otra oficina.
-8. El reporte agrega CUI y Tipo de trámite como sus dos columnas finales. Usa
-   `cui_proyecto` y `tipo_tramite_descripcion`; `tipo_tramite` se conserva como
-   identificador interno y no se presenta al usuario. Los valores nulos, vacios
-   o ausentes dejan celdas vacias sin retirar la fila.
+8. El reporte agrega CUI y Tipo de trámite, en ese orden, despues de las
+   columnas documentales existentes. Usa `cui_proyecto` y
+   `tipo_tramite_descripcion`; `tipo_tramite` se conserva como identificador
+   interno y no se presenta al usuario. Los valores nulos, vacios o ausentes
+   dejan celdas vacias sin retirar la fila.
+9. `N. Documento` muestra tipo, correlativo, anio y siglas con el formato
+   `TIPO 000000-AAAA-SIGLAS`. El correlativo anterior se conserva como la ultima
+   columna `Numero correlativo` para cruces; si falta fecha o siglas, la
+   numeracion visible conserva solo el correlativo y no inventa componentes.
 
 ## Estados Operativos
 
