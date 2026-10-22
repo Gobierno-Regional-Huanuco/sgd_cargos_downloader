@@ -63,7 +63,8 @@ class RecipientOfficesTests(unittest.TestCase):
         self.assertEqual(rows[4][5], "")
         self.assertEqual(rows[5][5], "")
         for row in rows[1:]:
-            self.assertEqual(row[1], row[-1])
+            self.assertEqual(row[1], row[-2])
+            self.assertEqual(row[0], row[-1])
 
     def test_excel_wraps_and_preserves_long_recipient_text(self) -> None:
         offices = "GERENCIA DE ADMINISTRACION, OFICINA DE CONTABILIDAD, OFICINA DE TESORERIA"
@@ -89,7 +90,23 @@ class RecipientOfficesTests(unittest.TestCase):
             sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
             styles = workbook.read("xl/styles.xml").decode("utf-8")
         self.assertIn(offices, sheet)
+        self.assertIn('min="1" max="1" width="45"', sheet)
+        self.assertIn('min="2" max="2" width="45"', sheet)
+        self.assertIn('min="4" max="4" width="65"', sheet)
         self.assertIn('min="5" max="5" width="48"', sheet)
+        self.assertIn('min="7" max="7" width="10"', sheet)
+        self.assertIn(
+            '<c r="B5" s="4" t="inlineStr"><is><t></t></is></c>',
+            sheet,
+        )
+        self.assertIn(
+            '<c r="G5" s="4" t="inlineStr"><is><t></t></is></c>',
+            sheet,
+        )
+        self.assertIn(
+            '<c r="M5" s="4" t="inlineStr"><is><t></t></is></c>',
+            sheet,
+        )
         self.assertIn('wrapText="1"', styles)
 
     def test_cui_and_procedure_type_precede_correlative_column(self) -> None:
@@ -134,11 +151,12 @@ class RecipientOfficesTests(unittest.TestCase):
                 "CUI",
                 "Tipo de trámite",
                 "Número correlativo",
+                "Reg. SGD",
             ],
         )
-        self.assertEqual(rows[1][-3:], ["2468101", "EJECUCION DE OBRA", "000001"])
+        self.assertEqual(rows[1][-4:], ["2468101", "EJECUCION DE OBRA", "000001", 1])
         for row in rows[2:]:
-            self.assertEqual(row[-3:-1], ["", ""])
+            self.assertEqual(row[-4:-2], ["", ""])
         with closing(sqlite3.connect(self.db_path)) as connection:
             stored_id = connection.execute(
                 "SELECT procedure_type_id FROM documents WHERE iddocumento = 1"
@@ -162,8 +180,9 @@ class RecipientOfficesTests(unittest.TestCase):
         self.assertIn("EJECUCION DE OBRA", sheet)
         self.assertIn('min="12" max="12" width="14"', sheet)
         self.assertIn('min="13" max="13" width="28"', sheet)
-        self.assertIn('mergeCell ref="N1"', sheet)
-        self.assertIn('mergeCell ref="N3"', sheet)
+        self.assertIn('min="15" max="15" width="14"', sheet)
+        self.assertIn('mergeCell ref="O1"', sheet)
+        self.assertIn('mergeCell ref="O3"', sheet)
 
     def test_composite_number_and_correlative_apply_to_main_and_related_reports(self) -> None:
         principal = self._document(
@@ -210,9 +229,10 @@ class RecipientOfficesTests(unittest.TestCase):
         )
 
         self.assertEqual(main_rows[1][1], "MEMORANDUM MULTIPLE 000635-2026-GRH/GGR")
-        self.assertEqual(main_rows[1][-1], "000635")
+        self.assertEqual(main_rows[1][-2:], ["000635", 100])
         self.assertEqual(related_rows[1][1], "INFORME 000027-2026-GRH/ORA")
-        self.assertEqual(related_rows[1][-1], "000027")
+        self.assertEqual(related_rows[0][-1], "Reg. SGD")
+        self.assertEqual(related_rows[1][-2:], ["000027", 101])
 
         output = self.root / "numbering-report.xlsx"
         self.assertEqual(
@@ -230,6 +250,8 @@ class RecipientOfficesTests(unittest.TestCase):
         self.assertIn("MEMORANDUM MULTIPLE 000635-2026-GRH/GGR", sheet)
         self.assertIn("Número correlativo", sheet)
         self.assertIn("<t>000635</t>", sheet)
+        self.assertIn("Reg. SGD", sheet)
+        self.assertIn("<t>100</t>", sheet)
 
     def test_schema_migration_backfills_report_fields_from_raw_json(self) -> None:
         self._create_version_3_database()

@@ -42,9 +42,12 @@ adjuntos de forma reanudable.
    interno y no se presenta al usuario. Los valores nulos, vacios o ausentes
    dejan celdas vacias sin retirar la fila.
 9. `N. Documento` muestra tipo, correlativo, anio y siglas con el formato
-   `TIPO 000000-AAAA-SIGLAS`. El correlativo anterior se conserva como la ultima
-   columna `Numero correlativo` para cruces; si falta fecha o siglas, la
-   numeracion visible conserva solo el correlativo y no inventa componentes.
+   `TIPO 000000-AAAA-SIGLAS`. El correlativo anterior se conserva en la columna
+   `Numero correlativo`; si falta fecha o siglas, la numeracion visible conserva
+   solo el correlativo y no inventa componentes.
+10. `Reg. SGD` es la ultima columna del reporte y conserva directamente
+    `iddocumento` para facilitar cruces y calculos, sin modificar la cantidad ni
+    el orden de las filas.
 
 ## Estados Operativos
 

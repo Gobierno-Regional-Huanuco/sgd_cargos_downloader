@@ -27,6 +27,7 @@ REPORT_COLUMNS = [
     "CUI",
     "Tipo de trámite",
     "Número correlativo",
+    "Reg. SGD",
 ]
 
 
@@ -118,6 +119,7 @@ def related_preview_rows(
         "Digital",
         "Observaciones",
         "Número correlativo",
+        "Reg. SGD",
     ]
     data = [
         [
@@ -133,6 +135,7 @@ def related_preview_rows(
             "",
             row["observations"] or "",
             row["document_number"] or "",
+            row["iddocumento"],
         ]
         for row in rows
     ]
@@ -250,9 +253,9 @@ def _load_preview_groups(
 def _build_sheets(rows: list[sqlite3.Row], period: int) -> list[tuple[str, list[list[object]], list[tuple[int, int, str]]]]:
     grouped = _group_rows(rows, period)
     if not grouped:
-        return [("Sin registros", _sheet_rows("SIN REGISTROS", period, []), [(1, 1, "N1"), (3, 3, "N3")])]
+        return [("Sin registros", _sheet_rows("SIN REGISTROS", period, []), [(1, 1, "O1"), (3, 3, "O3")])]
 
-    sheets = [(name, _sheet_rows(document_type, period, grouped_rows), [(1, 1, "N1"), (3, 3, "N3")]) for name, document_type, grouped_rows in grouped]
+    sheets = [(name, _sheet_rows(document_type, period, grouped_rows), [(1, 1, "O1"), (3, 3, "O3")]) for name, document_type, grouped_rows in grouped]
     return sheets
 
 
@@ -297,6 +300,7 @@ def _report_row(row: sqlite3.Row) -> list[object]:
         row["project_cui"] or "",
         row["procedure_type_description"] or "",
         row["document_number"] or "",
+        row["iddocumento"],
     ]
 
 
@@ -319,7 +323,7 @@ def _worksheet_xml(rows: list[list[object]], merges: list[tuple[int, int, str]])
     for row_index, row in enumerate(rows, start=1):
         cells = []
         for col_index, value in enumerate(row, start=1):
-            if value == "":
+            if value == "" and row_index < 4:
                 continue
             style = "1" if row_index == 1 else "2" if row_index == 4 else "3" if row_index <= 3 else "4"
             cells.append(_cell_xml(row_index, col_index, value, style))
@@ -336,13 +340,13 @@ def _worksheet_xml(rows: list[list[object]], merges: list[tuple[int, int, str]])
         '<sheetViews><sheetView workbookViewId="0"/></sheetViews>'
         '<sheetFormatPr defaultRowHeight="18"/>'
         '<cols>'
-        '<col min="1" max="1" width="14" customWidth="1"/>'
-        '<col min="2" max="2" width="16" customWidth="1"/>'
+        '<col min="1" max="1" width="45" customWidth="1"/>'
+        '<col min="2" max="2" width="45" customWidth="1"/>'
         '<col min="3" max="3" width="18" customWidth="1"/>'
-        '<col min="4" max="4" width="12" customWidth="1"/>'
+        '<col min="4" max="4" width="65" customWidth="1"/>'
         '<col min="5" max="5" width="48" customWidth="1"/>'
         '<col min="6" max="6" width="28" customWidth="1"/>'
-        '<col min="7" max="7" width="28" customWidth="1"/>'
+        '<col min="7" max="7" width="10" customWidth="1"/>'
         '<col min="8" max="8" width="10" customWidth="1"/>'
         '<col min="9" max="9" width="16" customWidth="1"/>'
         '<col min="10" max="10" width="28" customWidth="1"/>'
@@ -350,6 +354,7 @@ def _worksheet_xml(rows: list[list[object]], merges: list[tuple[int, int, str]])
         '<col min="12" max="12" width="14" customWidth="1"/>'
         '<col min="13" max="13" width="28" customWidth="1"/>'
         '<col min="14" max="14" width="18" customWidth="1"/>'
+        '<col min="15" max="15" width="14" customWidth="1"/>'
         '</cols>'
         f'<sheetData>{"".join(xml_rows)}</sheetData>'
         f"{merge_xml}"
