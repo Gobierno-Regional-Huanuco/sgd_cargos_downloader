@@ -51,7 +51,13 @@ Una fila representa un documento principal o relacionado recibido del SGD.
 `iddocumento` es la clave primaria dentro de la base del contexto activo.
 `period`, `scope` y `depe_id` delimitan consultas y reportes; `relation_kind`
 distingue principal de relacionado. `raw_json` conserva el payload recibido para
-reconstruir archivos y campos no normalizados.
+reconstruir archivos y campos no normalizados. `recipient_offices` conserva sin
+reprocesar el texto opcional `oficinas_destinatarias` entregado por el SGD; un
+valor nulo, vacio o ausente se guarda como texto vacio para el reporte.
+`project_cui`, `procedure_type_id` y `procedure_type_description` conservan los
+campos opcionales `cui_proyecto`, `tipo_tramite` y
+`tipo_tramite_descripcion`. Solo CUI y la descripcion legible se exportan; el
+identificador del tipo de tramite permanece interno.
 
 Indices relevantes: reporte por contexto/tipo/fecha/numero, principales por
 contexto y relacionados por principal.

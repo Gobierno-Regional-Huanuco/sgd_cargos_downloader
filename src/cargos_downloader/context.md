@@ -33,6 +33,13 @@ adjuntos de forma reanudable.
 5. Los adjuntos relacionados se guardan dentro de la carpeta de su principal y
    se prefijan con el nombre del relacionado para evitar colisiones.
 6. Cambiar la URL del servicio cierra la sesion. La clave nunca se guarda.
+7. El reporte muestra `oficinas_destinatarias` tal como lo entrega el SGD en
+   una sola celda por documento. Un valor nulo, vacio o ausente deja la celda
+   vacia y nunca oculta el documento ni se reemplaza con otra oficina.
+8. El reporte agrega CUI y Tipo de trámite como sus dos columnas finales. Usa
+   `cui_proyecto` y `tipo_tramite_descripcion`; `tipo_tramite` se conserva como
+   identificador interno y no se presenta al usuario. Los valores nulos, vacios
+   o ausentes dejan celdas vacias sin retirar la fila.
 
 ## Estados Operativos
 

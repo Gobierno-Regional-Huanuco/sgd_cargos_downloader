@@ -17,13 +17,15 @@ REPORT_COLUMNS = [
     "Firmante",
     "Fecha",
     "Asunto",
-    "Dirigido a",
+    "Oficinas destinatarias",
     "Expediente y Documento",
     "Folios",
     "Fisico/Digital",
     "Digital",
     "Observaciones",
     "Relacionados",
+    "CUI",
+    "Tipo de trámite",
 ]
 
 
@@ -154,8 +156,9 @@ def _load_rows(db_path: Path, *, period: int, scope: str, depe_id: int) -> list[
             connection.execute(
                 """
                 SELECT p.iddocumento, p.document_type, p.document_number, p.document_date,
-                       p.signer, p.subject, p.addressee, p.expediente_documento, p.folios,
-                       p.storage_type, p.observations, COUNT(rel.related_id) AS related_count
+                       p.signer, p.subject, p.recipient_offices, p.expediente_documento, p.folios,
+                       p.storage_type, p.observations, COUNT(rel.related_id) AS related_count,
+                       p.project_cui, p.procedure_type_description
                 FROM documents AS p
                 LEFT JOIN document_relations AS rel
                   ON rel.master_id = p.iddocumento
@@ -210,9 +213,10 @@ def _load_preview_groups(
                         GROUP BY master_id
                     )
                     SELECT p.iddocumento, p.document_type, p.document_number, p.document_date,
-                           p.signer, p.subject, p.addressee, p.expediente_documento, p.folios,
+                           p.signer, p.subject, p.recipient_offices, p.expediente_documento, p.folios,
                            p.storage_type, p.observations,
-                           COALESCE(rc.related_count, 0) AS related_count
+                           COALESCE(rc.related_count, 0) AS related_count,
+                           p.project_cui, p.procedure_type_description
                     FROM documents AS p
                     LEFT JOIN related_counts AS rc ON rc.master_id = p.iddocumento
                     WHERE p.period = ? AND p.scope = ? AND p.depe_id = ?
@@ -240,9 +244,9 @@ def _load_preview_groups(
 def _build_sheets(rows: list[sqlite3.Row], period: int) -> list[tuple[str, list[list[object]], list[tuple[int, int, str]]]]:
     grouped = _group_rows(rows, period)
     if not grouped:
-        return [("Sin registros", _sheet_rows("SIN REGISTROS", period, []), [(1, 1, "K1"), (3, 3, "K3")])]
+        return [("Sin registros", _sheet_rows("SIN REGISTROS", period, []), [(1, 1, "M1"), (3, 3, "M3")])]
 
-    sheets = [(name, _sheet_rows(document_type, period, grouped_rows), [(1, 1, "K1"), (3, 3, "K3")]) for name, document_type, grouped_rows in grouped]
+    sheets = [(name, _sheet_rows(document_type, period, grouped_rows), [(1, 1, "M1"), (3, 3, "M3")]) for name, document_type, grouped_rows in grouped]
     return sheets
 
 
@@ -277,13 +281,15 @@ def _report_row(row: sqlite3.Row) -> list[object]:
         row["signer"] or "",
         _format_date(row["document_date"]),
         row["subject"] or "",
-        row["addressee"] or "",
+        row["recipient_offices"] or "",
         row["expediente_documento"] or "",
         row["folios"] or "",
         row["storage_type"] or "",
         "",
         row["observations"] or "",
         row["related_count"] or "",
+        row["project_cui"] or "",
+        row["procedure_type_description"] or "",
     ]
 
 
@@ -327,13 +333,15 @@ def _worksheet_xml(rows: list[list[object]], merges: list[tuple[int, int, str]])
         '<col min="2" max="2" width="16" customWidth="1"/>'
         '<col min="3" max="3" width="18" customWidth="1"/>'
         '<col min="4" max="4" width="12" customWidth="1"/>'
-        '<col min="5" max="5" width="38" customWidth="1"/>'
+        '<col min="5" max="5" width="48" customWidth="1"/>'
         '<col min="6" max="6" width="28" customWidth="1"/>'
         '<col min="7" max="7" width="28" customWidth="1"/>'
         '<col min="8" max="8" width="10" customWidth="1"/>'
         '<col min="9" max="9" width="16" customWidth="1"/>'
         '<col min="10" max="10" width="28" customWidth="1"/>'
         '<col min="11" max="11" width="12" customWidth="1"/>'
+        '<col min="12" max="12" width="14" customWidth="1"/>'
+        '<col min="13" max="13" width="28" customWidth="1"/>'
         '</cols>'
         f'<sheetData>{"".join(xml_rows)}</sheetData>'
         f"{merge_xml}"

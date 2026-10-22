@@ -30,6 +30,19 @@ recurso local gestionado por esta aplicacion.
 
 - Los documentos se consultan por periodo mediante `fecha_desde` y
   `fecha_hasta`, con `include_files=1`.
+- Cada documento puede incluir `oficinas_destinatarias`, texto ya consolidado
+  por el SGD con las oficinas derivadas directamente desde la operacion inicial
+  de registro, sin incluir derivaciones posteriores, sin duplicados y ordenadas
+  alfabeticamente. Puede ser `null` o no estar presente durante la compatibilidad
+  con versiones anteriores; ambos casos representan una celda vacia y no
+  excluyen el documento.
+- Cada documento puede incluir `cui_proyecto`, `tipo_tramite` y
+  `tipo_tramite_descripcion`. Los tres campos son opcionales durante la
+  compatibilidad con versiones anteriores. El reporte muestra `cui_proyecto`
+  como CUI y `tipo_tramite_descripcion` como Tipo de trámite; `tipo_tramite` se
+  conserva solo como identificador interno. Valores nulos, vacios o ausentes
+  dejan la celda correspondiente vacia y no excluyen el documento; un CUI cero
+  tampoco se presenta.
 - Los relacionados se consultan por lotes de IDs, paginados. Cada fila debe
   incluir `master_id`; `meta.related_total` representa el total del lote y no
   solo la pagina.
