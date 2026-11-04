@@ -124,6 +124,16 @@ $env:PYTHONPATH = "src"
 .\.venv\Scripts\python.exe -m compileall -q src
 ```
 
+Ejecutar las pruebas automatizadas (usan directorios temporales y no consultan
+el SGD):
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe -m unittest discover -s tests
+```
+
+En Bash o WSL: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`.
+
 El validador de memoria es de solo lectura y requiere Git Bash o WSL:
 
 ```bash

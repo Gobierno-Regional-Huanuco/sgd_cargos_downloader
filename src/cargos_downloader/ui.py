@@ -40,10 +40,12 @@ from cargos_downloader.api import SgdApiClient, SgdApiError
 from cargos_downloader.config import APP_DIR, AppConfig, load_config, save_config
 from cargos_downloader.downloader import DownloadOptions, run_download, run_file_download
 from cargos_downloader.excel_exporter import (
-    export_report_files,
+    classification_warning_message,
+    export_report,
     preview_sheets,
     related_count,
     related_preview_rows,
+    report_path,
 )
 from cargos_downloader.storage import (
     clear_database,
@@ -57,6 +59,26 @@ from cargos_downloader.storage import (
 
 PREVIEW_ROW_LIMIT = 300
 RELATED_ROW_LIMIT = 500
+PREVIEW_COLUMN_WIDTHS = {
+    "Tipo": 140,
+    "N. Documento": 220,
+    "Firmante": 160,
+    "Fecha": 90,
+    "Asunto": 420,
+    "Oficinas destinatarias": 360,
+    "Expediente y Documento": 180,
+    "Folios": 70,
+    "Fisico/Digital": 95,
+    "Digital": 70,
+    "Observaciones": 180,
+    "Relacionados": 90,
+    "CUI": 110,
+    "Tipo de trámite": 220,
+    "Número correlativo": 140,
+    "Origen": 150,
+    "Registrado por": 220,
+    "Reg. SGD": 90,
+}
 LOG_FILE = APP_DIR / "app.log"
 PROGRESS_STYLE_RUNNING = """
 QProgressBar::chunk {
@@ -755,26 +777,29 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Exportar Excel", f"No existe la base local: {db_path}")
             return
 
+        scope = str(self.scope_combo.currentData())
+        depe_id = int(office["depe_id"])
         try:
-            reports = export_report_files(
+            result = export_report(
                 db_path,
-                output,
+                report_path(output, period=self.config.period, scope=scope, depe_id=depe_id),
                 period=self.config.period,
-                scope=self.scope_combo.currentData(),
-                depe_id=int(office["depe_id"]),
-                separate_personal=(
-                    self.scope_combo.currentData() == "oficina"
-                    and self.config.include_personal_for_office
-                ),
+                scope=scope,
+                depe_id=depe_id,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Exportar Excel", str(exc))
             self._append_log(f"Error exportando Excel: {exc}")
             return
 
-        for excel_file, records in reports:
-            self._append_log(f"Excel generado: {excel_file}")
-            self._append_log(f"Registros exportados: {records}.")
+        self._append_log(f"Excel generado: {result.output_file}")
+        self._append_log(
+            f"Registros exportados: {result.records} (externos: {result.external_records})."
+        )
+        if result.unclassified:
+            message = classification_warning_message(result.unclassified)
+            self._append_log(message)
+            QMessageBox.warning(self, "Exportar Excel", message)
         self.load_preview()
 
     def clear_local_database(self) -> None:
@@ -861,7 +886,8 @@ class MainWindow(QMainWindow):
         self._append_log(
             "Archivos finalizados. "
             f"Descargados: {stats.files_downloaded}, "
-            f"omitidos: {stats.files_skipped}, errores: {stats.files_failed}."
+            f"omitidos: {stats.files_skipped}, reubicados: {stats.files_moved}, "
+            f"errores: {stats.files_failed}."
         )
         if stats.catalog_file:
             self._append_log(f"Catalogo de archivos: {stats.catalog_file}")
@@ -1008,20 +1034,8 @@ class MainWindow(QMainWindow):
                 for col_index, value in enumerate(row):
                     self.preview_table.setItem(row_index, col_index, QTableWidgetItem(str(value or "")))
             self.preview_table.hideColumn(0)
-            self.preview_table.setColumnWidth(1, 90)
-            self.preview_table.setColumnWidth(2, 160)
-            self.preview_table.setColumnWidth(3, 90)
-            self.preview_table.setColumnWidth(4, 420)
-            self.preview_table.setColumnWidth(5, 360)
-            self.preview_table.setColumnWidth(6, 180)
-            self.preview_table.setColumnWidth(7, 70)
-            self.preview_table.setColumnWidth(8, 95)
-            self.preview_table.setColumnWidth(9, 70)
-            self.preview_table.setColumnWidth(10, 180)
-            self.preview_table.setColumnWidth(11, 90)
-            self.preview_table.setColumnWidth(12, 110)
-            self.preview_table.setColumnWidth(13, 220)
-            self.preview_table.setColumnWidth(14, 140)
+            for col_index, header in enumerate(headers[1:], start=1):
+                self.preview_table.setColumnWidth(col_index, PREVIEW_COLUMN_WIDTHS.get(header, 120))
         finally:
             self.preview_table.setUpdatesEnabled(True)
         self.related_button.setEnabled(bool(data_rows))

@@ -25,7 +25,8 @@ Aplicar primero `AGENTS.md`, [convenciones.md](../../docs/convenciones.md) y el
 
 ## Validaciones
 
-Ejecutar la compilacion Python de [procedimientos.md](../../docs/procedimientos.md)
-y las pruebas manuales del flujo afectado. Ejecutar tambien
+Ejecutar la compilacion Python y las pruebas `unittest` de
+[procedimientos.md](../../docs/procedimientos.md), ademas de las pruebas
+manuales del flujo afectado. Ejecutar tambien
 `scripts/validate-project-memory` desde Git Bash o WSL antes de cerrar cambios
 estructurales o documentales.

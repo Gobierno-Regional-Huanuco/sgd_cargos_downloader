@@ -58,6 +58,13 @@ valor nulo, vacio o ausente se guarda como texto vacio para el reporte.
 campos opcionales `cui_proyecto`, `tipo_tramite` y
 `tipo_tramite_descripcion`. Solo CUI y la descripcion legible se exportan; el
 identificador del tipo de tramite permanece interno.
+`origin_group`, `registrant_id` y `classification_issue` (esquema 7) guardan
+la clasificacion calculada por `classification.py` desde el payload:
+`oficina`, `personal`, `manual`, `pide` o `sin_clasificar`; el ID de quien
+registra y, si existe, la causa por la que no pudo clasificarse. Al migrar una
+base anterior se completan desde `raw_json`. No hay columna de nombre: al
+exportar, el nombre visible se deduce de `signer` de los personales solo
+cuando es unico para ese usuario y no se repite en otro; si no, se usa el ID.
 `document_number` conserva el correlativo normalizado a seis digitos y
 `document_acronyms` conserva `docu_siglas_doc`. El tipo y la fecha ya
 normalizados permiten construir la numeracion visible sin modificar el
@@ -88,6 +95,9 @@ tipo, tamano esperado, estado, intentos, ultimo error y fechas.
 
 Los estados son `pendiente`, `descargado` y `error`. Un archivo existente con
 tamano valido se registra como descargado aunque no se transfiera de nuevo.
+Si la ruta calculada de un adjunto cambia, por ejemplo al ubicarlo en
+`_EXTERNOS` o `_PERSONALES`, la fila con el mismo `file_id`, `document_id` y
+`master_id` cambia su `relative_path` cuando el archivo se mueve localmente.
 
 ## Integridad Y Retencion
 
@@ -101,7 +111,10 @@ tamano valido se registra como descargado aunque no se transfiera de nuevo.
 
 ## Verificacion
 
-Ejecutar la compilacion descrita en [procedimientos.md](procedimientos.md) y
-realizar una sincronizacion de prueba. La cardinalidad fisica y las claves se
-verifican leyendo las sentencias `CREATE TABLE` de `storage.py`; no hay una
-prueba automatizada de esquema en el repositorio todavia.
+Ejecutar la compilacion y las pruebas descritas en
+[procedimientos.md](procedimientos.md) y realizar una sincronizacion de prueba.
+La migracion desde un esquema anterior y el completado de columnas desde
+`raw_json` estan cubiertos por `tests/test_recipient_offices.py`; la
+reubicacion de adjuntos en el catalogo, por `tests/test_external_documents.py`.
+Las claves y la cardinalidad fisica se verifican leyendo las sentencias
+`CREATE TABLE` de `storage.py`.

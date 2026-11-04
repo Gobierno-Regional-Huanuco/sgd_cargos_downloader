@@ -12,12 +12,8 @@ from unittest.mock import Mock, patch
 from cargos_downloader.api import SgdApiClient
 from cargos_downloader.excel_exporter import (
     export_report,
-    export_report_files,
-    manual_report_path,
-    personal_report_path,
     preview_sheets,
     related_preview_rows,
-    report_path,
 )
 from cargos_downloader.storage import (
     SCHEMA_VERSION,
@@ -69,7 +65,7 @@ class RecipientOfficesTests(unittest.TestCase):
         self.assertEqual(rows[4][5], "")
         self.assertEqual(rows[5][5], "")
         for row in rows[1:]:
-            self.assertEqual(row[1], row[-2])
+            self.assertEqual(row[1], row[-4])
             self.assertEqual(row[0], row[-1])
 
     def test_excel_wraps_and_preserves_long_recipient_text(self) -> None:
@@ -83,7 +79,7 @@ class RecipientOfficesTests(unittest.TestCase):
         )
         output = self.root / "report.xlsx"
 
-        count = export_report(
+        result = export_report(
             self.db_path,
             output,
             period=2026,
@@ -91,7 +87,7 @@ class RecipientOfficesTests(unittest.TestCase):
             depe_id=10,
         )
 
-        self.assertEqual(count, 1)
+        self.assertEqual(result.records, 1)
         with zipfile.ZipFile(output) as workbook:
             sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
             styles = workbook.read("xl/styles.xml").decode("utf-8")
@@ -157,12 +153,17 @@ class RecipientOfficesTests(unittest.TestCase):
                 "CUI",
                 "Tipo de trámite",
                 "Número correlativo",
+                "Origen",
+                "Registrado por",
                 "Reg. SGD",
             ],
         )
-        self.assertEqual(rows[1][-4:], ["2468101", "EJECUCION DE OBRA", "000001", 1])
+        self.assertEqual(
+            rows[1][-6:],
+            ["2468101", "EJECUCION DE OBRA", "000001", "Sin clasificar", "", 1],
+        )
         for row in rows[2:]:
-            self.assertEqual(row[-4:-2], ["", ""])
+            self.assertEqual(row[-6:-4], ["", ""])
         with closing(sqlite3.connect(self.db_path)) as connection:
             stored_id = connection.execute(
                 "SELECT procedure_type_id FROM documents WHERE iddocumento = 1"
@@ -177,7 +178,7 @@ class RecipientOfficesTests(unittest.TestCase):
             scope="oficina",
             depe_id=10,
         )
-        self.assertEqual(exported, 5)
+        self.assertEqual(exported.records, 5)
         with zipfile.ZipFile(output) as workbook:
             sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
         self.assertIn("CUI", sheet)
@@ -186,9 +187,9 @@ class RecipientOfficesTests(unittest.TestCase):
         self.assertIn("EJECUCION DE OBRA", sheet)
         self.assertIn('min="12" max="12" width="14"', sheet)
         self.assertIn('min="13" max="13" width="28"', sheet)
-        self.assertIn('min="15" max="15" width="14"', sheet)
-        self.assertIn('mergeCell ref="O1"', sheet)
-        self.assertIn('mergeCell ref="O3"', sheet)
+        self.assertIn('min="17" max="17" width="14"', sheet)
+        self.assertIn('mergeCell ref="A1:Q1"', sheet)
+        self.assertIn('mergeCell ref="A3:Q3"', sheet)
 
     def test_composite_number_and_correlative_apply_to_main_and_related_reports(self) -> None:
         principal = self._document(
@@ -235,7 +236,8 @@ class RecipientOfficesTests(unittest.TestCase):
         )
 
         self.assertEqual(main_rows[1][1], "MEMORANDUM MULTIPLE 000635-2026-GRH/GGR")
-        self.assertEqual(main_rows[1][-2:], ["000635", 100])
+        self.assertEqual(main_rows[1][-4], "000635")
+        self.assertEqual(main_rows[1][-1], 100)
         self.assertEqual(related_rows[1][1], "INFORME 000027-2026-GRH/ORA")
         self.assertEqual(related_rows[0][-1], "Reg. SGD")
         self.assertEqual(related_rows[1][-2:], ["000027", 101])
@@ -248,7 +250,7 @@ class RecipientOfficesTests(unittest.TestCase):
                 period=2026,
                 scope="oficina",
                 depe_id=10,
-            ),
+            ).records,
             1,
         )
         with zipfile.ZipFile(output) as workbook:
@@ -258,97 +260,6 @@ class RecipientOfficesTests(unittest.TestCase):
         self.assertIn("<t>000635</t>", sheet)
         self.assertIn("Reg. SGD", sheet)
         self.assertIn("<t>100</t>", sheet)
-
-    def test_office_export_separates_office_external_and_each_personal_user(self) -> None:
-        upsert_documents(
-            self.db_path,
-            [
-                self._document(201, document_origin=1, document_kind=0),
-                self._document(212, document_origin=1, document_kind=None),
-                self._document(
-                    202,
-                    document_origin=1,
-                    document_kind=1,
-                    document_user_id=30,
-                    operation_user_id=999,
-                    signer="ANA PEREZ",
-                ),
-                self._document(
-                    203,
-                    document_origin=1,
-                    document_kind=1,
-                    operation_user_id=30,
-                    signer="ANA PEREZ",
-                ),
-                self._document(
-                    204,
-                    document_origin=1,
-                    document_kind=1,
-                    document_user_id=40,
-                    signer="LUIS ROJAS",
-                ),
-                self._document(205, document_origin=2),
-                self._document(206, document_origin=3),
-            ],
-            period=2026,
-            scope="oficina",
-            depe_id=10,
-        )
-
-        reports = export_report_files(
-            self.db_path,
-            self.root,
-            period=2026,
-            scope="oficina",
-            depe_id=10,
-            separate_personal=True,
-        )
-
-        office_file = report_path(self.root, period=2026, scope="oficina", depe_id=10)
-        manual_file = manual_report_path(
-            self.root,
-            period=2026,
-            scope="oficina",
-            depe_id=10,
-        )
-        ana_file = personal_report_path(
-            self.root,
-            period=2026,
-            scope="oficina",
-            depe_id=10,
-            user_id="30",
-            signer="ANA PEREZ",
-        )
-        luis_file = personal_report_path(
-            self.root,
-            period=2026,
-            scope="oficina",
-            depe_id=10,
-            user_id="40",
-            signer="LUIS ROJAS",
-        )
-        self.assertEqual(
-            reports,
-            [(office_file, 2), (manual_file, 2), (ana_file, 2), (luis_file, 1)],
-        )
-        with zipfile.ZipFile(office_file) as workbook:
-            office_sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-        with zipfile.ZipFile(manual_file) as workbook:
-            manual_sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-        with zipfile.ZipFile(ana_file) as workbook:
-            ana_sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-        with zipfile.ZipFile(luis_file) as workbook:
-            luis_sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-        self.assertIn("ASUNTO 201", office_sheet)
-        self.assertIn("ASUNTO 212", office_sheet)
-        self.assertNotIn("ASUNTO 202", office_sheet)
-        self.assertIn("ASUNTO 205", manual_sheet)
-        self.assertIn("ASUNTO 206", manual_sheet)
-        self.assertIn("ASUNTO 202", ana_sheet)
-        self.assertIn("ASUNTO 203", ana_sheet)
-        self.assertNotIn("ASUNTO 204", ana_sheet)
-        self.assertIn("ASUNTO 204", luis_sheet)
-        self.assertNotIn("ASUNTO 202", luis_sheet)
 
     def test_include_personal_is_propagated_to_batch_and_file_download(self) -> None:
         client = SgdApiClient("https://sgd.example/")
@@ -374,45 +285,6 @@ class RecipientOfficesTests(unittest.TestCase):
             )
         self.assertEqual(send.call_args.kwargs["params"]["include_personal"], 1)
 
-    def test_separate_export_reports_each_invalid_classification_cause(self) -> None:
-        upsert_documents(
-            self.db_path,
-            [
-                self._document(207, document_kind=0),
-                self._document(208, document_origin=1),
-                self._document(209, document_origin=1, document_kind=7),
-                self._document(210, document_origin=1, document_kind=1),
-                self._document(
-                    211,
-                    document_origin=1,
-                    document_kind=1,
-                    operation_user_id="NO NUMERICO",
-                ),
-            ],
-            period=2026,
-            scope="oficina",
-            depe_id=10,
-        )
-        with self.assertRaises(ValueError) as raised:
-            export_report_files(
-                self.db_path,
-                self.root,
-                period=2026,
-                scope="oficina",
-                depe_id=10,
-                separate_personal=True,
-            )
-        message = str(raised.exception)
-        self.assertIn("5 documento(s)", message)
-        self.assertIn("docu_origen ausente o vacío: 1. Reg. SGD: 207.", message)
-        self.assertIn("docu_tipo ausente", message)
-        self.assertIn("docu_tipo no reconocido (7)", message)
-        self.assertIn("docu_idusuario y oper_idusuario ausentes o vacíos", message)
-        self.assertIn("Reg. SGD: 210.", message)
-        self.assertIn("oper_idusuario no es numérico", message)
-        self.assertIn("Reg. SGD: 211.", message)
-        self.assertIn("app.log", message)
-
     def test_schema_migration_backfills_report_fields_from_raw_json(self) -> None:
         self._create_version_3_database()
 
@@ -422,7 +294,8 @@ class RecipientOfficesTests(unittest.TestCase):
             row = connection.execute(
                 """
                 SELECT recipient_offices, project_cui, procedure_type_id,
-                       procedure_type_description, document_acronyms
+                       procedure_type_description, document_acronyms,
+                       origin_group, registrant_id, classification_issue
                 FROM documents WHERE iddocumento = 1
                 """
             ).fetchone()
@@ -431,7 +304,16 @@ class RecipientOfficesTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(
             row,
-            ("OFICINA DE TESORERIA", "2468101", 4, "EJECUCION DE OBRA", "GRH/GGR"),
+            (
+                "OFICINA DE TESORERIA",
+                "2468101",
+                4,
+                "EJECUCION DE OBRA",
+                "GRH/GGR",
+                "oficina",
+                "30",
+                None,
+            ),
         )
         self.assertEqual(version, (str(SCHEMA_VERSION),))
 
@@ -495,6 +377,9 @@ class RecipientOfficesTests(unittest.TestCase):
                 procedure_type="EJECUCION DE OBRA",
                 document_date="2026-10-20",
                 acronyms="GRH/GGR",
+                document_origin=1,
+                document_kind=0,
+                document_user_id=30,
             )
         )
         with closing(sqlite3.connect(self.db_path)) as connection:

@@ -31,7 +31,14 @@ adjuntos de forma reanudable.
 4. La descarga de archivos parte del inventario local `files`; no vuelve a listar
    documentos. Debe registrar su resultado por destino fisico.
 5. Los adjuntos relacionados se guardan dentro de la carpeta de su principal y
-   se prefijan con el nombre del relacionado para evitar colisiones.
+   se prefijan con el nombre del relacionado para evitar colisiones. La
+   carpeta base depende del origen del principal: oficina y sin clasificar en
+   la raiz del contexto, personales en `_PERSONALES\{usuario}` y
+   manuales/externos o PIDE en `_EXTERNOS\{usuario}`, donde `{usuario}` es la
+   etiqueta de la regla 12 o `SIN USUARIO`. Un externo sin siglas agrega
+   `[Reg {iddocumento}]` a su carpeta y un numero no numerico usa el rango
+   `SIN NUMERO`. Si un adjunto ya descargado cambia de ruta, se mueve
+   localmente y conserva su estado sin volver a descargarse.
 6. Cambiar la URL del servicio cierra la sesion. La clave nunca se guarda.
 7. El reporte muestra `oficinas_destinatarias` tal como lo entrega el SGD en
    una sola celda por documento. Un valor nulo, vacio o ausente deja la celda
@@ -48,17 +55,27 @@ adjuntos de forma reanudable.
 10. `Reg. SGD` es la ultima columna del reporte y conserva directamente
     `iddocumento` para facilitar cruces y calculos, sin modificar la cantidad ni
     el orden de las filas.
-11. Cuando el alcance oficina incluye documentos personales, la exportacion
-    genera un libro de oficina, otro de manuales/externos —incluidos los de
-    interoperabilidad/PIDE— y un libro por cada usuario con documentos
-    personales. La clasificacion usa `docu_origen` y `docu_tipo`; un
-    `docu_tipo` nulo se interpreta como `0` y permanece en el libro de oficina.
-    Los personales con `docu_tipo=1` se agrupan por `docu_idusuario`, con respaldo
-    temporal en `oper_idusuario` solo cuando el primero esta ausente o es nulo,
-    y usan el firmante solo como etiqueta del archivo. Nunca mezcla registros
-    cuya clasificacion o usuario no pueda determinarse. Si encuentra datos
-    invalidos, informa cantidades y una muestra de IDs por cada causa; el mismo
-    detalle queda en el log de la aplicacion.
+11. La exportacion genera siempre un unico libro por contexto. Oficina,
+    personales y documentos sin clasificar comparten las hojas por tipo
+    documental; los manuales/externos y los de interoperabilidad/PIDE van a la
+    hoja `{periodo} EXTERNOS`, que agrega la columna Tipo y solo existe cuando
+    hay externos. La clasificacion vive en `classification.py` y usa
+    `docu_origen` (`1` interno, `2` manual/externo, `3` PIDE) y `docu_tipo`
+    (`0` oficina, `1` personal; nulo equivale a `0`). Un personal exige un
+    usuario valido. Un documento con clasificacion invalida no bloquea la
+    exportacion: se exporta con Origen `Sin clasificar` y se informan
+    cantidades y una muestra de IDs por causa en un aviso y en el log.
+12. Todas las hojas agregan Origen y Registrado por antes de `Reg. SGD`, con
+    filtro automatico y encabezado fijo para filtrar por ambos. Quien registra
+    es `docu_idusuario`, con respaldo temporal en `oper_idusuario` solo cuando el
+    primero esta ausente o es nulo. El SGD no envia su nombre: se deduce solo
+    de los documentos personales del contexto, nunca de firmantes de oficina o
+    externos, y solo cuando no hay duda: todos los personales del usuario
+    tienen el mismo firmante y ese firmante no aparece en los personales de
+    otro usuario. Entonces se muestra `{id} - {nombre}`; en cualquier otro caso
+    se muestra solo el `{id}`. El ID es la referencia que separa filtros y
+    carpetas. Esta deduccion es provisional hasta contar con el listado oficial
+    de usuarios.
 
 ## Estados Operativos
 
@@ -84,6 +101,8 @@ adjuntos de forma reanudable.
 1. Un login valida oficinas y alcances habilitados por el SGD.
 2. Una sincronizacion con relacionados conserva `master_id` y no bloquea la UI.
 3. Una descarga cancelada puede reanudarse sin repetir archivos validos.
+4. Una exportacion de oficina con personales y externos genera un solo libro
+   con la hoja de externos y las columnas Origen y Registrado por.
 
 ## Decisiones Vigentes
 
@@ -91,3 +110,5 @@ adjuntos de forma reanudable.
 | --- | --- | --- | --- |
 | 2026-09-01 | Separar registros de archivos | Evitar relistar documentos al bajar adjuntos | Dos SQLite por contexto |
 | 2026-09-01 | Agrupar adjuntos por tipo y rango de 1000 | Evitar directorios planos grandes | El numero documental define el rango |
+| 2026-11-03 | Un unico libro con Origen y Registrado por | Filtrar por usuario sin multiplicar archivos | Se retiran los libros de externos y personales por usuario |
+| 2026-11-03 | Adjuntos externos y personales en carpetas por usuario | Separar lo que cada usuario registra | Los adjuntos ya descargados se reubican localmente |

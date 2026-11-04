@@ -1,8 +1,8 @@
 # SGD Cargos Downloader
 
-Aplicacion de escritorio en Python para registrar documentos emitidos desde la
-API `/api/cargos` del SGD, generar un Excel de registro y descargar sus
-archivos adjuntos.
+Aplicacion de escritorio en Python para registrar los documentos de oficina,
+personales y externos que entrega la API `/api/cargos` del SGD, generar un
+Excel de registro y descargar sus archivos adjuntos.
 
 ## Requisitos e instalacion inicial
 
@@ -109,9 +109,12 @@ En esa carpeta activa se generan:
 
 - `cargos_sgd.sqlite`: base de datos local portable con los registros sincronizados.
 - `descargas_archivos.sqlite`: catalogo persistente del estado de cada archivo descargado.
-- `registro_documentos_{periodo}_{alcance}_{oficina}.xlsx`: reporte Excel con
-  una hoja por tipo de documento del periodo.
-- Archivos adjuntos en la estructura por tipo/rango/documento.
+- `registro_documentos_{periodo}_{alcance}_{oficina}.xlsx`: unico reporte
+  Excel con una hoja por tipo de documento del periodo y una hoja
+  `{periodo} EXTERNOS` cuando hay manuales/externos o PIDE.
+- Archivos adjuntos en la estructura por tipo/rango/documento. Los de oficina
+  quedan en la raiz; los personales en `_PERSONALES\{id} - {nombre}` y los
+  externos en `_EXTERNOS\{id} - {nombre}`.
 
 La interfaz separa tres acciones:
 
@@ -151,9 +154,13 @@ filas por hoja; el Excel exporta todos los registros principales.
 - La columna `Firmante` se muestra junto al numero de documento y usa `docu_firma`.
 - El Excel exporta solo documentos principales y agrega una columna
   `Relacionados` con la cantidad de documentos vinculados.
-- Al incluir documentos personales en el alcance de oficina, la exportacion
-  genera un Excel de oficina, otro de manuales/externos e interoperabilidad/PIDE
-  y un Excel por cada usuario que tenga documentos personales.
+- Cada hoja incluye las columnas `Origen` (Oficina, Personal, Manual/Externo,
+  Interoperabilidad/PIDE o Sin clasificar) y `Registrado por`, con filtro
+  automatico para separar por usuario u origen. `En oficina, incluir documentos
+  personales` solo agrega los personales al mismo libro.
+- `Registrado por` muestra `{id} - {nombre}` solo cuando el nombre se deduce
+  sin duda de los documentos personales de ese usuario: un unico firmante que
+  no comparte con otro usuario. En cualquier otro caso muestra solo el `{id}`.
 - La base SQLite se limpia automaticamente cuando cambia el contexto de
   descarga: periodo, alcance u oficina.
 - Los documentos relacionados se consultan por lotes con

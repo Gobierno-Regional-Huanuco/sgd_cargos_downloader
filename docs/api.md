@@ -43,18 +43,23 @@ recurso local gestionado por esta aplicacion.
   conserva solo como identificador interno. Valores nulos, vacios o ausentes
   dejan la celda correspondiente vacia y no excluyen el documento; un CUI cero
   tampoco se presenta.
-- La separacion de reportes de oficina usa `docu_origen`, `docu_tipo` y
+- La clasificacion de origen usa `docu_origen`, `docu_tipo` y
   `docu_idusuario`. Un origen `1` con tipo `0` identifica un documento de
   oficina; un origen `1` con tipo `1`, uno personal; los origenes `2` y `3`
   corresponden a documentos manuales/externos e interoperabilidad/PIDE. Los
   documentos con origen `1` y `docu_tipo` explicitamente `null` se consideran
   de oficina porque `0` es el valor predeterminado de ese campo; un campo
-  ausente, vacio o invalido no activa este respaldo. Los
-  personales se agrupan por `docu_idusuario`; mientras el backend actualizado se
-  despliega, el consumidor usa temporalmente `oper_idusuario` solo cuando
-  `docu_idusuario` esta ausente o es `null`. `docu_firma` solo aporta el nombre
-  visible. Si no puede determinarse la clasificacion o faltan ambos IDs en un
-  documento personal, el consumidor detiene la exportacion para evitar mezclas.
+  ausente, vacio o invalido no activa este respaldo. En todos los origenes
+  `docu_idusuario` identifica a quien registra; mientras el backend actualizado
+  se despliega, el consumidor usa temporalmente `oper_idusuario` solo cuando
+  `docu_idusuario` esta ausente o es `null`. El SGD no entrega el nombre de
+  quien registra: el consumidor solo lo deduce de `docu_firma` de los
+  personales de ese usuario cuando no hay ambiguedad y, si no, presenta solo el
+  ID. Un listado oficial de usuarios lo reemplazaria. Si no puede determinarse la
+  clasificacion o falta el usuario de un documento personal, el documento se
+  exporta como `Sin clasificar` y se informa; no se excluye. El listado de
+  `scope=oficina` devuelve los externos registrados en la oficina; una oficina
+  que no registra externos no recibe ninguno.
 - Los documentos principales y relacionados incluyen `docu_numero_doc`,
   `docu_fecha_doc`, `docu_siglas_doc` y `tdoc_descripcion`. El consumidor usa
   estos campos para presentar la numeracion compuesta; `docu_siglas_doc` puede

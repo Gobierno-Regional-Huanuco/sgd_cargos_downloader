@@ -3,8 +3,9 @@
 ## Proposito
 
 SGD Cargos Downloader es una aplicacion de escritorio Windows que consume la
-API existente del SGD. Registra documentos emitidos, conserva una copia local
-por usuario y contexto, exporta un libro Excel y descarga los adjuntos que ya
+API existente del SGD. Registra los documentos de oficina, personales y
+externos que el SGD entrega para el contexto, conserva una copia local por
+usuario y contexto, exporta un libro Excel y descarga los adjuntos que ya
 fueron inventariados.
 
 La aplicacion no publica una API ni accede directamente a la base de datos del
@@ -16,7 +17,9 @@ archivos remotos.
 - Python y PySide6 para la aplicación de escritorio.
 - `requests` para el consumo HTTP autenticado del SGD.
 - SQLite para el registro local y el catálogo de archivos descargados.
-- `openpyxl` para la exportación del formato de cargos.
+- Biblioteca estándar (`zipfile` y XML) para generar el XLSX del formato de
+  cargos, sin dependencias adicionales.
+- `unittest` para las pruebas automatizadas de `tests/`.
 
 ## Componentes
 
@@ -35,6 +38,7 @@ Usuario
 | `downloader.py` | Sincronizacion paginada, relaciones por lote y descarga reanudable | No dibuja UI |
 | `storage.py` | Esquema SQLite, migracion, contexto y catalogo de archivos | No conoce widgets ni credenciales |
 | `excel_exporter.py` | Vista previa y XLSX de documentos principales | No consulta al SGD |
+| `classification.py` | Origen y usuario que registra de cada documento | No lee SQLite ni archivos |
 | `config.py` | Preferencias locales y URL portable del servicio | No guarda claves ni tokens |
 
 ## Flujo global
@@ -46,7 +50,9 @@ Usuario
    lotes, guardandolos en `cargos_sgd.sqlite`.
 4. `Descargar archivos` usa los arreglos `files` guardados y actualiza
    `descargas_archivos.sqlite` mientras descarga los pendientes.
-5. `Exportar Excel` genera un reporte de principales por tipo documental.
+5. `Exportar Excel` genera un unico reporte de principales por tipo documental,
+   con una hoja de externos y columnas de origen y usuario que registra. La
+   clasificacion compartida por Excel y adjuntos vive en `classification.py`.
 
 ## Limites De Contexto
 

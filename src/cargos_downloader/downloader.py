@@ -1,19 +1,29 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 
 from cargos_downloader.api import SgdApiClient, SgdApiError
+from cargos_downloader.classification import (
+    EXTERNAL_ORIGINS,
+    ORIGIN_PERSONAL,
+    classify_document,
+    registrant_label,
+)
 from cargos_downloader.storage import (
     clear_database,
     context_matches,
     database_path,
+    file_download_entries,
     file_download_sources,
     init_database,
     mark_file_download,
+    registrant_names,
+    rename_file_download,
     upsert_related_records,
     upsert_documents,
     upsert_file_download_tasks,
@@ -23,6 +33,10 @@ from cargos_downloader.storage import (
 
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 SPACES = re.compile(r"\s+")
+EXTERNAL_FILES_DIR = "_EXTERNOS"
+PERSONAL_FILES_DIR = "_PERSONALES"
+UNKNOWN_REGISTRANT_DIR = "SIN USUARIO"
+NO_NUMBER_RANGE = "SIN NUMERO"
 
 
 @dataclass
@@ -61,6 +75,7 @@ class FileDownloadStats:
     files_downloaded: int = 0
     files_skipped: int = 0
     files_failed: int = 0
+    files_moved: int = 0
     catalog_file: Path | None = None
 
 
@@ -71,17 +86,27 @@ def sanitize_filename(value: object, fallback: str = "sin_nombre") -> str:
     return text[:160] or fallback
 
 
-def document_name(document: dict) -> str:
+def document_name(document: dict, *, disambiguate: bool = False) -> str:
+    """Nombre de carpeta del documento.
+
+    Con `disambiguate`, un documento sin siglas agrega su Reg. SGD para que
+    dos externos de entidades distintas con el mismo numero no compartan carpeta.
+    """
     tipo = sanitize_filename(document.get("tdoc_descripcion"), "DOCUMENTO")
     number = document.get("docu_numero_doc")
     siglas = sanitize_filename(document.get("docu_siglas_doc"), "")
     if number is None:
         number_text = document.get("iddocumento_text") or document.get("iddocumento")
     else:
-        number_text = str(number).zfill(6)
+        try:
+            number_text = str(int(number)).zfill(6)
+        except (TypeError, ValueError):
+            number_text = str(number).strip()
     parts = [tipo, str(number_text)]
     if siglas:
         parts.append(siglas)
+    elif disambiguate and document.get("iddocumento") is not None:
+        parts.append(f"[Reg {document.get('iddocumento')}]")
     return sanitize_filename(" ".join(parts), str(document.get("iddocumento", "documento")))
 
 
@@ -90,16 +115,44 @@ def range_name(document: dict, group_size: int) -> str:
     try:
         number = int(value)
     except (TypeError, ValueError):
-        number = 1
+        return NO_NUMBER_RANGE
     group_size = max(1, group_size)
     start = ((max(1, number) - 1) // group_size) * group_size + 1
     end = start + group_size - 1
     return f"{start:06d}-{end:06d}"
 
 
-def document_folder(base_dir: Path, document: dict, group_size: int) -> Path:
+def document_folder(
+    base_dir: Path,
+    document: dict,
+    group_size: int,
+    *,
+    disambiguate: bool = False,
+) -> Path:
     tipo = sanitize_filename(document.get("tdoc_descripcion"), "DOCUMENTO")
-    return base_dir / tipo / range_name(document, group_size) / document_name(document)
+    return (
+        base_dir
+        / tipo
+        / range_name(document, group_size)
+        / document_name(document, disambiguate=disambiguate)
+    )
+
+
+def owner_folder(output_dir: Path, master_document: dict, names: dict[str, str]) -> tuple[Path, bool]:
+    """Carpeta base segun el origen del principal: oficina, personal o externo.
+
+    Devuelve tambien si el documento es externo, para desambiguar sus nombres.
+    """
+    classification = classify_document(master_document)
+    if classification.group in EXTERNAL_ORIGINS:
+        return output_dir / EXTERNAL_FILES_DIR / _registrant_folder(classification.registrant_id, names), True
+    if classification.group == ORIGIN_PERSONAL:
+        return output_dir / PERSONAL_FILES_DIR / _registrant_folder(classification.registrant_id, names), False
+    return output_dir, False
+
+
+def _registrant_folder(registrant_id: str | None, names: dict[str, str]) -> str:
+    return sanitize_filename(registrant_label(registrant_id, names), UNKNOWN_REGISTRANT_DIR)
 
 
 def file_name(file_data: dict, prefix: str | None = None) -> str:
@@ -498,9 +551,18 @@ def run_file_download(
         scope=options.scope,
         depe_id=options.depe_id,
     )
-    tasks = _file_tasks(options.output_dir, sources, options.group_size)
-    upsert_file_download_tasks(options.output_dir, tasks)
+    names = registrant_names(
+        db_path,
+        period=options.period,
+        scope=options.scope,
+        depe_id=options.depe_id,
+    )
+    tasks = _file_tasks(options.output_dir, sources, options.group_size, names)
     stats = FileDownloadStats(files_total=len(tasks))
+    stats.files_moved = _relocate_downloaded_files(options.output_dir, tasks, log)
+    if stats.files_moved:
+        log(f"Archivos reubicados en su nueva carpeta sin volver a descargarlos: {stats.files_moved}.")
+    upsert_file_download_tasks(options.output_dir, tasks)
     stats.catalog_file = options.output_dir / "descargas_archivos.sqlite"
     if not tasks:
         log("No hay archivos adjuntos registrados para descargar.")
@@ -557,17 +619,83 @@ def run_file_download(
     return stats
 
 
+def _relocate_downloaded_files(
+    output_dir: Path,
+    tasks: list[dict[str, Any]],
+    log: Callable[[str], None],
+) -> int:
+    """Mueve adjuntos ya descargados cuya ruta cambio (por ejemplo, a `_EXTERNOS`).
+
+    La identidad del adjunto es `file_id`, `document_id` y `master_id`. Solo se
+    mueve si la ruta nueva aun no existe; el catalogo conserva su estado.
+    """
+    entries = file_download_entries(output_dir)
+    if not entries:
+        return 0
+    task_paths = {task["relative_path"] for task in tasks}
+    catalog_paths = {entry["relative_path"] for entry in entries}
+    previous: dict[tuple[Any, Any, Any], list[str]] = defaultdict(list)
+    for entry in entries:
+        if entry["relative_path"] not in task_paths:
+            key = (entry["file_id"], entry["document_id"], entry["master_id"])
+            previous[key].append(entry["relative_path"])
+
+    moved = 0
+    for task in tasks:
+        new_relative = task["relative_path"]
+        destination = output_dir / new_relative
+        if new_relative in catalog_paths or destination.exists():
+            continue
+        candidates = previous.get((task["file_id"], task["document_id"], task["master_id"]), [])
+        for old_relative in list(candidates):
+            source = output_dir / old_relative
+            if not source.is_file():
+                continue
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source.replace(destination)
+            except OSError as exc:
+                log(f"  No se pudo reubicar {old_relative}: {exc}")
+                break
+            rename_file_download(output_dir, old_relative, new_relative)
+            candidates.remove(old_relative)
+            _remove_empty_parents(source.parent, output_dir)
+            moved += 1
+            break
+    return moved
+
+
+def _remove_empty_parents(folder: Path, stop_at: Path) -> None:
+    stop = stop_at.resolve()
+    current = folder
+    while True:
+        try:
+            resolved = current.resolve()
+        except OSError:
+            return
+        if resolved == stop or stop not in resolved.parents:
+            return
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
 def _file_tasks(
     output_dir: Path,
     sources: list[tuple[dict[str, Any], int | None, dict[str, Any]]],
     group_size: int,
+    names: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
+    names = names or {}
     tasks_by_path: dict[str, dict[str, Any]] = {}
     for document, master_id, master_document in sources:
         files = document.get("files") or []
         if not isinstance(files, list):
             continue
-        folder = document_folder(output_dir, master_document, group_size)
+        base_dir, external = owner_folder(output_dir, master_document, names)
+        folder = document_folder(base_dir, master_document, group_size, disambiguate=external)
         prefix = document_name(document) if master_id is not None else None
         document_id = _document_identifier(document)
         if document_id is None:

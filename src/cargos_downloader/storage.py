@@ -3,13 +3,71 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections import Counter, defaultdict
 from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from cargos_downloader.classification import ORIGIN_PERSONAL, classify_document
 
-SCHEMA_VERSION = 6
+
+SCHEMA_VERSION = 7
 INVALID_PATH_SEGMENT = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+DOCUMENT_UPSERT_SQL = """
+    INSERT INTO documents (
+        iddocumento, period, scope, depe_id, relation_kind, master_id,
+        document_type, document_number, document_acronyms, signer, document_date, subject,
+        addressee, recipient_offices,
+        project_cui, procedure_type_id, procedure_type_description,
+        expediente_documento, folios, storage_type, observations, file_count,
+        origin_group, registrant_id, classification_issue, raw_json, synced_at
+    )
+    VALUES (
+        :iddocumento, :period, :scope, :depe_id, :relation_kind, :master_id,
+        :document_type, :document_number, :document_acronyms, :signer, :document_date, :subject,
+        :addressee, :recipient_offices,
+        :project_cui, :procedure_type_id, :procedure_type_description,
+        :expediente_documento, :folios, :storage_type, :observations, :file_count,
+        :origin_group, :registrant_id, :classification_issue,
+        :raw_json, CURRENT_TIMESTAMP
+    )
+    ON CONFLICT(iddocumento) DO UPDATE SET
+        period = excluded.period,
+        scope = excluded.scope,
+        depe_id = excluded.depe_id,
+        relation_kind = CASE
+            WHEN documents.relation_kind = 'principal' OR excluded.relation_kind = 'principal'
+            THEN 'principal'
+            ELSE excluded.relation_kind
+        END,
+        master_id = CASE
+            WHEN documents.relation_kind = 'principal' OR excluded.relation_kind = 'principal'
+            THEN NULL
+            ELSE excluded.master_id
+        END,
+        document_type = excluded.document_type,
+        document_number = excluded.document_number,
+        document_acronyms = excluded.document_acronyms,
+        signer = excluded.signer,
+        document_date = excluded.document_date,
+        subject = excluded.subject,
+        addressee = excluded.addressee,
+        recipient_offices = excluded.recipient_offices,
+        project_cui = excluded.project_cui,
+        procedure_type_id = excluded.procedure_type_id,
+        procedure_type_description = excluded.procedure_type_description,
+        expediente_documento = excluded.expediente_documento,
+        folios = excluded.folios,
+        storage_type = excluded.storage_type,
+        observations = excluded.observations,
+        file_count = excluded.file_count,
+        origin_group = excluded.origin_group,
+        registrant_id = excluded.registrant_id,
+        classification_issue = excluded.classification_issue,
+        raw_json = excluded.raw_json,
+        synced_at = CURRENT_TIMESTAMP
+"""
 
 # MEMORY_ENTITY Document
 # MEMORY_ENTITY DocumentRelation
@@ -177,6 +235,77 @@ def file_download_sources(
     return sources
 
 
+def registrant_names(db_path: Path, *, period: int, scope: str, depe_id: int) -> dict[str, str]:
+    """Nombre visible por usuario, deducido solo de sus documentos personales.
+
+    El SGD no entrega el nombre de quien registra. Solo se asigna un nombre
+    cuando no hay duda en el contexto: todos los personales del usuario tienen
+    el mismo firmante y ese firmante no aparece en los personales de otro
+    usuario. En cualquier otro caso el usuario queda sin nombre y se muestra
+    solo su ID. Los firmantes se comparan sin distinguir mayusculas ni espacios.
+    """
+    init_database(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT registrant_id, signer, COUNT(*)
+            FROM documents
+            WHERE period = ? AND scope = ? AND depe_id = ?
+              AND origin_group = ? AND registrant_id IS NOT NULL
+              AND TRIM(COALESCE(signer, '')) <> ''
+            GROUP BY registrant_id, signer
+            """,
+            (period, scope, depe_id, ORIGIN_PERSONAL),
+        ).fetchall()
+    spellings: dict[str, Counter[str]] = defaultdict(Counter)
+    signers_by_user: dict[str, set[str]] = defaultdict(set)
+    users_by_signer: dict[str, set[str]] = defaultdict(set)
+    for registrant_id, signer, total in rows:
+        user = str(registrant_id)
+        display = " ".join(str(signer).split())
+        key = display.casefold()
+        spellings[key][display] += int(total)
+        signers_by_user[user].add(key)
+        users_by_signer[key].add(user)
+
+    names: dict[str, str] = {}
+    for user, keys in signers_by_user.items():
+        if len(keys) != 1:
+            continue
+        key = next(iter(keys))
+        if len(users_by_signer[key]) != 1:
+            continue
+        names[user] = sorted(spellings[key].items(), key=lambda item: (-item[1], item[0]))[0][0]
+    return names
+
+
+def file_download_entries(output_dir: Path) -> list[dict[str, Any]]:
+    path = init_file_catalog(output_dir)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT relative_path, file_id, document_id, master_id, status FROM file_downloads"
+            )
+        ]
+
+
+def rename_file_download(output_dir: Path, old_relative_path: str, new_relative_path: str) -> None:
+    """Mueve la identidad de un adjunto ya descargado a su nueva ruta relativa."""
+    path = init_file_catalog(output_dir)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            "DELETE FROM file_downloads WHERE relative_path = ?",
+            (new_relative_path,),
+        )
+        connection.execute(
+            "UPDATE file_downloads SET relative_path = ? WHERE relative_path = ?",
+            (new_relative_path, old_relative_path),
+        )
+        connection.commit()
+
+
 def database_has_documents(output_dir: Path) -> bool:
     db_path = database_path(output_dir)
     if not db_path.exists():
@@ -284,6 +413,9 @@ def init_database(path: Path) -> None:
                 storage_type TEXT NOT NULL,
                 observations TEXT,
                 file_count INTEGER NOT NULL DEFAULT 0,
+                origin_group TEXT,
+                registrant_id TEXT,
+                classification_issue TEXT,
                 raw_json TEXT NOT NULL,
                 synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -377,6 +509,12 @@ def _migrate_database(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE documents ADD COLUMN document_acronyms TEXT")
         columns.add("document_acronyms")
         document_acronyms_added = True
+    classification_added = False
+    for column in ("origin_group", "registrant_id", "classification_issue"):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE documents ADD COLUMN {column} TEXT")
+            columns.add(column)
+            classification_added = True
 
     version_row = connection.execute(
         "SELECT value FROM metadata WHERE key = 'schema_version'"
@@ -477,6 +615,34 @@ def _migrate_database(connection: sqlite3.Connection) -> None:
                 "UPDATE documents SET document_acronyms = ? WHERE iddocumento = ?",
                 updates,
             )
+    if classification_added or current_version < 7:
+        rows = connection.execute("SELECT iddocumento, raw_json FROM documents").fetchall()
+        updates = []
+        for document_id, raw_json in rows:
+            try:
+                document = json.loads(raw_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            classification = classify_document(document)
+            updates.append(
+                (
+                    classification.group,
+                    classification.registrant_id,
+                    classification.issue,
+                    document_id,
+                )
+            )
+        if updates:
+            connection.executemany(
+                """
+                UPDATE documents
+                SET origin_group = ?, registrant_id = ?, classification_issue = ?
+                WHERE iddocumento = ?
+                """,
+                updates,
+            )
 
 
 def upsert_document(
@@ -500,55 +666,7 @@ def upsert_document(
     )
     with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(
-            """
-            INSERT INTO documents (
-                iddocumento, period, scope, depe_id, relation_kind, master_id,
-                document_type, document_number, document_acronyms, signer, document_date, subject,
-                addressee, recipient_offices,
-                project_cui, procedure_type_id, procedure_type_description,
-                expediente_documento, folios, storage_type, observations, file_count, raw_json, synced_at
-            )
-            VALUES (
-                :iddocumento, :period, :scope, :depe_id, :relation_kind, :master_id,
-                :document_type, :document_number, :document_acronyms, :signer, :document_date, :subject,
-                :addressee, :recipient_offices,
-                :project_cui, :procedure_type_id, :procedure_type_description,
-                :expediente_documento, :folios, :storage_type, :observations, :file_count,
-                :raw_json, CURRENT_TIMESTAMP
-            )
-            ON CONFLICT(iddocumento) DO UPDATE SET
-                period = excluded.period,
-                scope = excluded.scope,
-                depe_id = excluded.depe_id,
-                relation_kind = CASE
-                    WHEN documents.relation_kind = 'principal' OR excluded.relation_kind = 'principal'
-                    THEN 'principal'
-                    ELSE excluded.relation_kind
-                END,
-                master_id = CASE
-                    WHEN documents.relation_kind = 'principal' OR excluded.relation_kind = 'principal'
-                    THEN NULL
-                    ELSE excluded.master_id
-                END,
-                document_type = excluded.document_type,
-                document_number = excluded.document_number,
-                document_acronyms = excluded.document_acronyms,
-                signer = excluded.signer,
-                document_date = excluded.document_date,
-                subject = excluded.subject,
-                addressee = excluded.addressee,
-                recipient_offices = excluded.recipient_offices,
-                project_cui = excluded.project_cui,
-                procedure_type_id = excluded.procedure_type_id,
-                procedure_type_description = excluded.procedure_type_description,
-                expediente_documento = excluded.expediente_documento,
-                folios = excluded.folios,
-                storage_type = excluded.storage_type,
-                observations = excluded.observations,
-                file_count = excluded.file_count,
-                raw_json = excluded.raw_json,
-                synced_at = CURRENT_TIMESTAMP
-            """,
+            DOCUMENT_UPSERT_SQL,
             values,
         )
         connection.commit()
@@ -599,55 +717,7 @@ def upsert_document_records(
         return 0
     with closing(sqlite3.connect(db_path)) as connection:
         connection.executemany(
-            """
-            INSERT INTO documents (
-                iddocumento, period, scope, depe_id, relation_kind, master_id,
-                document_type, document_number, document_acronyms, signer, document_date, subject,
-                addressee, recipient_offices,
-                project_cui, procedure_type_id, procedure_type_description,
-                expediente_documento, folios, storage_type, observations, file_count, raw_json, synced_at
-            )
-            VALUES (
-                :iddocumento, :period, :scope, :depe_id, :relation_kind, :master_id,
-                :document_type, :document_number, :document_acronyms, :signer, :document_date, :subject,
-                :addressee, :recipient_offices,
-                :project_cui, :procedure_type_id, :procedure_type_description,
-                :expediente_documento, :folios, :storage_type, :observations, :file_count,
-                :raw_json, CURRENT_TIMESTAMP
-            )
-            ON CONFLICT(iddocumento) DO UPDATE SET
-                period = excluded.period,
-                scope = excluded.scope,
-                depe_id = excluded.depe_id,
-                relation_kind = CASE
-                    WHEN documents.relation_kind = 'principal' OR excluded.relation_kind = 'principal'
-                    THEN 'principal'
-                    ELSE excluded.relation_kind
-                END,
-                master_id = CASE
-                    WHEN documents.relation_kind = 'principal' OR excluded.relation_kind = 'principal'
-                    THEN NULL
-                    ELSE excluded.master_id
-                END,
-                document_type = excluded.document_type,
-                document_number = excluded.document_number,
-                document_acronyms = excluded.document_acronyms,
-                signer = excluded.signer,
-                document_date = excluded.document_date,
-                subject = excluded.subject,
-                addressee = excluded.addressee,
-                recipient_offices = excluded.recipient_offices,
-                project_cui = excluded.project_cui,
-                procedure_type_id = excluded.procedure_type_id,
-                procedure_type_description = excluded.procedure_type_description,
-                expediente_documento = excluded.expediente_documento,
-                folios = excluded.folios,
-                storage_type = excluded.storage_type,
-                observations = excluded.observations,
-                file_count = excluded.file_count,
-                raw_json = excluded.raw_json,
-                synced_at = CURRENT_TIMESTAMP
-            """,
+            DOCUMENT_UPSERT_SQL,
             values,
         )
         connection.commit()
@@ -699,55 +769,7 @@ def upsert_related_records(
     init_database(db_path)
     with closing(sqlite3.connect(db_path)) as connection:
         connection.executemany(
-            """
-            INSERT INTO documents (
-                iddocumento, period, scope, depe_id, relation_kind, master_id,
-                document_type, document_number, document_acronyms, signer, document_date, subject,
-                addressee, recipient_offices,
-                project_cui, procedure_type_id, procedure_type_description,
-                expediente_documento, folios, storage_type, observations, file_count, raw_json, synced_at
-            )
-            VALUES (
-                :iddocumento, :period, :scope, :depe_id, :relation_kind, :master_id,
-                :document_type, :document_number, :document_acronyms, :signer, :document_date, :subject,
-                :addressee, :recipient_offices,
-                :project_cui, :procedure_type_id, :procedure_type_description,
-                :expediente_documento, :folios, :storage_type, :observations, :file_count,
-                :raw_json, CURRENT_TIMESTAMP
-            )
-            ON CONFLICT(iddocumento) DO UPDATE SET
-                period = excluded.period,
-                scope = excluded.scope,
-                depe_id = excluded.depe_id,
-                relation_kind = CASE
-                    WHEN documents.relation_kind = 'principal' OR excluded.relation_kind = 'principal'
-                    THEN 'principal'
-                    ELSE excluded.relation_kind
-                END,
-                master_id = CASE
-                    WHEN documents.relation_kind = 'principal' OR excluded.relation_kind = 'principal'
-                    THEN NULL
-                    ELSE excluded.master_id
-                END,
-                document_type = excluded.document_type,
-                document_number = excluded.document_number,
-                document_acronyms = excluded.document_acronyms,
-                signer = excluded.signer,
-                document_date = excluded.document_date,
-                subject = excluded.subject,
-                addressee = excluded.addressee,
-                recipient_offices = excluded.recipient_offices,
-                project_cui = excluded.project_cui,
-                procedure_type_id = excluded.procedure_type_id,
-                procedure_type_description = excluded.procedure_type_description,
-                expediente_documento = excluded.expediente_documento,
-                folios = excluded.folios,
-                storage_type = excluded.storage_type,
-                observations = excluded.observations,
-                file_count = excluded.file_count,
-                raw_json = excluded.raw_json,
-                synced_at = CURRENT_TIMESTAMP
-            """,
+            DOCUMENT_UPSERT_SQL,
             document_values,
         )
         connection.executemany(
@@ -776,6 +798,7 @@ def normalize_document(
     master_id: int | None,
 ) -> dict[str, Any]:
     files = document.get("files") or []
+    classification = classify_document(document)
     return {
         "iddocumento": _document_id(document),
         "period": period,
@@ -799,6 +822,9 @@ def normalize_document(
         "storage_type": "Digital" if files else "Fisico",
         "observations": _first_text(document, "docu_observacion", "observaciones"),
         "file_count": len(files),
+        "origin_group": classification.group,
+        "registrant_id": classification.registrant_id,
+        "classification_issue": classification.issue,
         "raw_json": json.dumps(document, ensure_ascii=False, default=str),
     }
 
